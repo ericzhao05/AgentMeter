@@ -1,0 +1,22 @@
+/* Tube styles, extracted unchanged from the AgentMeter tube design. */
+.tube { display: block; overflow: visible; }
+.tube .ol { stroke: #0A0A0C; stroke-linejoin: round; }                    /* bold dark outline */
+.tube .f-up { fill: #4A4A52; } .tube .f-half { fill: #38383E; } .tube .f-front { fill: #2A2A2E; }
+.tube .f-down { fill: #151517; } .tube .f-recess { fill: #0D0D0F; }       /* cel shades: flat fills, hard edges */
+.tube .hi { fill: none; stroke: #D2D2DC; stroke-linecap: round; stroke-linejoin: round; opacity: .9; }
+.tube .neon line { stroke: var(--neon); stroke-linecap: round; }
+.tube .neon .hot line { stroke: var(--neon-hot); }
+.tube .liquid-surface .top { fill: var(--liq-top); }                                   /* the surface, seen slightly from above */
+.tube .liquid-surface .back { fill: none; stroke: var(--liq-ring); stroke-width: 1.6; stroke-linejoin: round; opacity: .6; }
+.tube .liquid-surface .glint { fill: #fff; opacity: .3; }
+.tube .liquid-surface .front { fill: none; stroke: var(--liq-light); stroke-linecap: round; stroke-linejoin: round; }
+.tube .liquid-surface .under { fill: none; stroke: var(--liq-ring); stroke-linejoin: round; opacity: .4; }
+.tube .stream { fill: var(--liq); stroke: var(--liq-light); stroke-width: 1.4; stroke-linejoin: round; }   /* refill pour */
+.tube .aura { fill: var(--liq); }
+.tube .cap-light { fill: none; stroke: var(--liq); stroke-linecap: round; }
+.tube .glow-caps { mix-blend-mode: screen; }
+.tube .bubbles circle { fill: var(--liq-top); stroke: var(--liq-ring); stroke-width: .13; }  /* drawn at r = 1, then scaled */
+.tube .bubbles path { fill: none; stroke: var(--liq-deep); stroke-width: .17; stroke-linecap: round; opacity: .6; }   /* shaded lower-right */
+.tube .bubbles ellipse { fill: #fff; opacity: .9; }
+.tube .bubbles .pop circle { fill: none; stroke: var(--liq-light); stroke-width: .14; }      /* a burst bubble leaves a ring */
+.tube .bubbles .pop path, .tube .bubbles .pop ellipse { display: none; }

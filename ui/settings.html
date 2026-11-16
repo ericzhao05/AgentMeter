@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>AgentMeter Settings</title>
+<link rel="stylesheet" href="settings.css">
+</head>
+<body>
+
+<header class="top">
+  <h1 id="agents-title">Agents</h1>
+  <p class="status" id="status" role="status" aria-live="polite"></p>
+</header>
+<p class="hint" id="agents-hint">Choose which agents appear in the sidebar.</p>
+
+<div class="load-error" id="load-error" role="alert" hidden>
+  <span id="load-error-text">Couldn't load settings.</span>
+  <button type="button" id="load-retry">Retry</button>
+</div>
+
+<main aria-busy="true">
+  <ul class="agents" id="agents" aria-labelledby="agents-title" aria-describedby="agents-hint"></ul>
+  <p class="empty" id="agents-empty" hidden>No agents detected yet.</p>
+</main>
+
+<script src="settings.js"></script>
+</body>
+</html>

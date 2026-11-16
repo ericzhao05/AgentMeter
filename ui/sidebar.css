@@ -1,0 +1,80 @@
+/* Sidebar layout. Column width / heights must match the constants in src-tauri/src/lib.rs
+   (COL_W 86, PAD_X 10, SIDEBAR_H 382 = bar 26 + tube 280 + label 66 + bottom 10). */
+:root { color-scheme: dark; }
+html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+body {
+  color: #d6d6dc; user-select: none; -webkit-user-select: none; cursor: default;
+  font: 12px/1.25 ui-rounded, "SF Pro Rounded", "Avenir Next", system-ui, sans-serif;
+}
+/* Transparent by default (just tubes + labels). Slid out past the right screen edge until revealed;
+   a light grey rounded background (and the gear) only while the cursor is over it. */
+.panel {
+  box-sizing: border-box; height: 100%; padding: 0 10px 10px;
+  display: flex; flex-direction: column;
+  background: transparent; border: 1.5px solid transparent; border-radius: 14px;
+  transform: translateX(calc(100% + 24px));
+  transition: transform 200ms cubic-bezier(.2, .8, .2, 1), background-color 150ms, border-color 150ms;
+  will-change: transform;   /* own compositing layer: the slide is a pure GPU transform, no layout */
+}
+.panel.left { transform: translateX(calc(-100% - 24px)); }
+.panel.shown, .panel.left.shown { transform: none; }
+/* Docked left: mirror the header so the gear sits on the outer (screen-edge) side. */
+.panel.left .bar { flex-direction: row-reverse; }
+.panel.left .bar .title { text-align: right; padding: 0 2px 0 0; }
+.panel.hover { background: rgba(200, 200, 208, .30); border-color: rgba(255, 255, 255, .22); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }
+@media (prefers-reduced-motion: reduce) { .panel { transition: none; } }
+
+/* Header (title, demo badge, gear) only appears on hover. */
+/* Hidden header items take no space, so the notice gets the full width until hover. */
+.bar > *:not(.notice) { display: none; }
+.bar button { pointer-events: none; }
+.panel.hover .bar > *:not(.notice) { display: grid; }
+.panel.hover .bar > .title, .panel.hover .bar > .demo { display: block; }
+.panel.hover .bar > .demo[hidden] { display: none; }
+.panel.hover .bar button { pointer-events: auto; }
+.bar .title { text-shadow: 0 1px 2px rgba(0, 0, 0, .9); }
+
+/* "Couldn't read usage: …" — always visible while revealed (not hover-gated), one line in the header. */
+.bar .notice {
+  flex: 1 1 auto; min-width: 0; opacity: 1; font-size: 9.5px; line-height: 1.12; color: #f3d9a4;
+  /* up to two lines inside the 26px header, then an ellipsis (full text in the tooltip) */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+}
+.bar .notice[hidden] { display: none; }
+.bar .notice:not([hidden]) ~ .title { display: none; }
+.empty #empty-text { color: #f3d9a4; }
+
+/* Legible on any wallpaper without a background. */
+.label { text-shadow: 0 1px 2px rgba(0, 0, 0, .9), 0 0 6px rgba(0, 0, 0, .55); }
+.empty { text-shadow: 0 1px 2px rgba(0, 0, 0, .9); }
+.bar { height: 26px; display: flex; align-items: center; gap: 4px; flex: none; }
+.bar .title { flex: 1; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: #d6d6dc; padding-left: 2px; }
+.bar .demo { font-size: 9px; padding: 1px 5px; border-radius: 6px; background: rgba(217, 70, 239, .85); color: #fff; }
+.bar button {
+  width: 22px; height: 22px; padding: 0; display: grid; place-items: center;
+  font: 14px/1 system-ui, sans-serif; color: #f0f0f4; background: rgba(20, 20, 22, .62); border: 0; border-radius: 7px; cursor: pointer;
+}
+.bar button:hover { background: rgba(20, 20, 22, .9); color: #fff; }
+.bar button:focus-visible { outline: 2px solid #D946EF; outline-offset: 1px; }
+
+.tubes { display: flex; flex: 1; }
+.col { width: 86px; flex: none; display: flex; flex-direction: column; align-items: center; position: relative; }
+.col .tube { flex: none; }
+.label { height: 66px; width: 100%; box-sizing: border-box; padding-top: 4px; text-align: center; display: grid; align-content: start; gap: 1px; }
+.label .name { font-weight: 600; font-size: 11px; color: #ececf2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 2px; }
+.label .pct { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent, #fff); }
+.label .reset .t { white-space: nowrap; }
+.label .reset { font-size: 9.5px; line-height: 1.15; color: #b4b4be; font-variant-numeric: tabular-nums; padding: 0 3px; }
+.col.low .label .pct { color: #FF6B60; }
+
+/* Unknown usage: dimmed, empty tube and a "?" — never a made-up number. */
+.col.unknown .tube { opacity: .42; filter: saturate(.2); }
+.col.unknown .label .pct { color: #c4c4cc; font-size: 10px; font-weight: 600; line-height: 1.2; padding-top: 3px; }
+
+
+.col.missing .label .name { color: #a0a0aa; }
+
+.empty[hidden] { display: none; }
+.empty { flex: 1; margin: 0; display: grid; place-content: center; text-align: center; color: #7a7a84; font-size: 11px; }
+.empty .link { font: inherit; color: #c8c8d0; background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!-- AgentMeter menu-bar icon: macOS template image (black + alpha only; the system tints it).
+       Tube silhouette: two caps, a hollow glass body and liquid filling the lower part.
+       Drawn on whole pixels so the 22px (1x) render stays crisp; 44px (2x) is the same art doubled. -->
+  <g fill="#000">
+    <rect x="4" y="2" width="14" height="3" rx="1"/>
+    <rect x="4" y="17" width="14" height="3" rx="1"/>
+    <!-- glass walls (hollow above the liquid) + liquid -->
+    <path fill-rule="evenodd" d="M7 5h8v12H7zM8 5v5h6V5z"/>
+  </g>
+</svg>
