@@ -55,6 +55,9 @@ pub struct Loaded {
     pub settings: Settings,
     /// No usable `agents` list was found (first run, or it was unreadable): seed installed agents.
     pub needs_default_agents: bool,
+    /// Set when an invalid settings file could NOT be preserved: nothing may write settings.json
+    /// until `preserve_existing` succeeds or the user explicitly resets.
+    pub blocked: Option<String>,
 }
 
 fn config_file(app: &AppHandle, name: &str) -> Option<PathBuf> {
@@ -94,8 +97,38 @@ fn write_json<T: Serialize>(app: &AppHandle, name: &str, value: &T) -> Result<()
     write_atomic(&path, json.as_bytes())
 }
 
+/// Collision-safe backup name: timestamp + pid + per-process counter.
 fn corrupt_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!("settings.json.corrupt-{}", unix_ts()))
+    static N: AtomicU64 = AtomicU64::new(0);
+    path.with_file_name(format!(
+        "settings.json.corrupt-{}-{}-{}",
+        unix_ts(),
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Copy an existing settings file aside (keeps the original in place). A missing file is fine.
+fn preserve_at(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+    let aside = corrupt_path(path);
+    fs::copy(path, &aside).map(|_| Some(aside)).map_err(|e| format!("cannot back up {}: {e}", path.display()))
+}
+
+/// Retry preserving the current settings file (used before writing while blocked).
+pub fn preserve_existing(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    preserve_at(&config_file(app, "settings.json").ok_or("no app config dir")?)
+}
+
+fn blocked_msg(path: &Path, why: &str) -> String {
+    format!(
+        "Your settings file {} could not be read or backed up ({why}), so AgentMeter won't overwrite it. \
+         Fix or move that file, or choose \"Reset Settings\" in the menu-bar icon to start fresh.",
+        path.display()
+    )
 }
 
 /// Read settings. Missing file → defaults. Unreadable / unparsable file → moved aside, defaults.
@@ -103,40 +136,47 @@ fn corrupt_path(path: &Path) -> PathBuf {
 pub fn load(app: &AppHandle) -> Loaded {
     match config_file(app, "settings.json") {
         Some(path) => load_from(&path),
-        None => Loaded { settings: Settings::default(), needs_default_agents: true },
+        None => Loaded { settings: Settings::default(), needs_default_agents: true, blocked: None },
     }
 }
 
 fn load_from(path: &Path) -> Loaded {
     let path = path.to_path_buf();
-    let fresh = Loaded { settings: Settings::default(), needs_default_agents: true };
+    let fresh = Loaded { settings: Settings::default(), needs_default_agents: true, blocked: None };
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == ErrorKind::NotFound => return fresh,
         Err(e) => {
             let aside = corrupt_path(&path);
-            let moved = fs::rename(&path, &aside).is_ok();
+            let moved = fs::rename(&path, &aside);
             eprintln!(
                 "[agentmeter] cannot read {}: {e}; {}; using defaults",
                 path.display(),
-                if moved { format!("moved it to {}", aside.display()) } else { "left it in place".into() }
+                match &moved { Ok(()) => format!("moved it to {}", aside.display()), Err(m) => format!("could not move it aside ({m}): writes blocked") }
             );
-            // If it couldn't be moved aside, don't seed (and so don't write) defaults over it.
-            return Loaded { settings: Settings::default(), needs_default_agents: moved };
+            return Loaded {
+                settings: Settings::default(),
+                needs_default_agents: true,
+                blocked: moved.err().map(|m| blocked_msg(&path, &format!("{e}; {m}"))),
+            };
         }
     };
     let obj = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(m)) => m,
         other => {
+            let why = other.err().map(|e| e.to_string()).unwrap_or_else(|| "not a JSON object".into());
             let aside = corrupt_path(&path);
-            let moved = fs::rename(&path, &aside).is_ok();
+            let moved = fs::rename(&path, &aside);
             eprintln!(
-                "[agentmeter] {} is not a JSON object ({}); {}; using defaults",
+                "[agentmeter] {} is invalid ({why}); {}; using defaults",
                 path.display(),
-                other.err().map(|e| e.to_string()).unwrap_or_else(|| "wrong type".into()),
-                if moved { format!("moved it to {}", aside.display()) } else { "could not move it aside".into() }
+                match &moved { Ok(()) => format!("moved it to {}", aside.display()), Err(m) => format!("could not move it aside ({m}): writes blocked") }
             );
-            return Loaded { settings: Settings::default(), needs_default_agents: moved };
+            return Loaded {
+                settings: Settings::default(),
+                needs_default_agents: true,
+                blocked: moved.err().map(|m| blocked_msg(&path, &format!("{why}; {m}"))),
+            };
         }
     };
 
@@ -177,14 +217,15 @@ fn load_from(path: &Path) -> Loaded {
         bad.push("dockEdge".into());
     }
     let invalid: Vec<_> = bad.iter().filter(|b| !b.ends_with("(missing)")).collect();
+    let mut blocked = None;
     if !invalid.is_empty() {
-        let aside = corrupt_path(&path);
-        let copied = fs::copy(&path, &aside).is_ok();
+        let kept = preserve_at(&path);
         eprintln!(
-            "[agentmeter] invalid settings fields {invalid:?} in {}; defaulted them{}",
+            "[agentmeter] invalid settings fields {invalid:?} in {}; defaulted them; {}",
             path.display(),
-            if copied { format!(", original kept at {}", aside.display()) } else { String::new() }
+            match &kept { Ok(p) => format!("original kept at {:?}", p), Err(m) => format!("{m}: writes blocked") }
         );
+        blocked = kept.err().map(|m| blocked_msg(&path, &format!("invalid {invalid:?}; {m}")));
     }
 
     let needs_default_agents = agents.is_none();
@@ -195,7 +236,7 @@ fn load_from(path: &Path) -> Loaded {
         dock_edge: dock_edge.unwrap_or(d.dock_edge),
     }
     .normalized();
-    Loaded { settings, needs_default_agents }
+    Loaded { settings, needs_default_agents, blocked }
 }
 
 /// Persist settings. Callers must hold the settings mutex (single writer).
@@ -270,6 +311,7 @@ mod tests {
         assert!(!l.needs_default_agents);
         assert_eq!(fs::read_to_string(&p).unwrap(), orig, "file untouched");
         assert_eq!(corrupt_files(&d).len(), 1, "a copy of the original is kept");
+        assert!(l.blocked.is_none());
     }
 
     #[test]
@@ -282,6 +324,30 @@ mod tests {
         assert_eq!(l.settings, s);
         assert!(!l.needs_default_agents);
         assert_eq!(fs::read_dir(&d).unwrap().count(), 1, "no temp or corrupt files left behind");
+        assert!(l.blocked.is_none());
+    }
+
+    #[test]
+    fn failed_backup_blocks_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("blocked");
+        let p = d.join("settings.json");
+        fs::write(&p, "{ not json").unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap(); // dir read-only: no rename/copy
+        let l = load_from(&p);
+        let retry = preserve_at(&p);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(l.blocked.is_some(), "unpreserved original must block writes");
+        assert!(retry.is_err());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "{ not json", "original untouched");
+        // Once the directory is writable again, preserving succeeds and unblocks.
+        assert!(preserve_at(&p).unwrap().is_some());
+    }
+
+    #[test]
+    fn backup_names_do_not_collide() {
+        let p = Path::new("/x/settings.json");
+        assert_ne!(corrupt_path(p), corrupt_path(p));
     }
 
     #[test]

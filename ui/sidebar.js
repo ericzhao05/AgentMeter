@@ -112,7 +112,10 @@ $('empty-settings').addEventListener('click', () => invoke('open_settings').catc
 $('hide').addEventListener('click', () => appWindow.hide());
 // Drag the sidebar from anywhere except its buttons.
 $('panel').addEventListener('mousedown', e => {
-  if (e.button === 0 && !e.target.closest('button')) appWindow.startDragging().catch(() => {});
+  if (e.button === 0 && !e.target.closest('button')) {
+    invoke('drag_began').catch(() => {});   // backend won't reposition the window while it is being dragged
+    appWindow.startDragging().catch(() => {});
+  }
 });
 
 // Listen first, then fetch the initial snapshots. A snapshot is applied only if no event for that

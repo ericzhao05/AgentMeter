@@ -3,7 +3,7 @@ name = "agentmeter"
 version = "0.1.0"
 description = "AgentMeter: a desktop sidebar showing how much of each AI coding agent's usage limit is left"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.82"
 
 [lib]
 name = "agentmeter_lib"
