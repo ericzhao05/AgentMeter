@@ -6,7 +6,7 @@ const appWindow = window.__TAURI__.window.getCurrentWindow();
 
 /* Liquid colour per agent (brand-ish); unknown ids get a stable colour from the fallback palette. */
 const AGENT_COLORS = {
-  claude: '#D97757', codex: '#10A37F', gemini: '#4E86F7', cursor: '#E6E6E6',
+  'claude-code': '#D97757', claude: '#D97757', codex: '#10A37F', gemini: '#4E86F7', cursor: '#E6E6E6',
   copilot: '#8957E5', windsurf: '#2EC4B6', aider: '#14B014', amp: '#F34E3F', opencode: '#FAB283',
 };
 const FALLBACK = ['#F5B83D', '#36B9F0', '#E85D9E', '#9BD84A', '#B38CFF'];

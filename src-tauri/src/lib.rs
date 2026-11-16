@@ -1,14 +1,12 @@
 mod settings;
-mod usage_stub;
 
-// The one line to change when the real crate lands: `use agentmeter_usage as usage;`
-use usage_stub as usage;
+use agentmeter_usage as usage;
 
 use settings::{DockEdge, Settings};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{
@@ -37,8 +35,9 @@ struct AppState {
     move_gen: AtomicU64,
 }
 
-fn now_secs() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+fn launch_secs() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
 fn sidebar_width(tubes: u32) -> f64 {
@@ -241,7 +240,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) {
     std::thread::spawn(move || loop {
         let demo = state.settings.lock().unwrap().demo_mode;
-        let data = if demo { usage::mock_all(now_secs()) } else { usage::poll_all() };
+        let data = if demo { usage::mock_all(launch_secs()) } else { usage::poll_all() };
 
         // First run without a settings file: enable every installed agent, in detection order.
         if !demo {
@@ -255,6 +254,19 @@ fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) 
                 let _ = app.emit("settings-changed", &s);
             }
         }
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[agentmeter] {} poll: {}",
+            if demo { "demo" } else { "real" },
+            data.iter()
+                .map(|a| format!(
+                    "{}(installed={} left={:?} exact={} active={} resets={:?} note={:?})",
+                    a.id, a.installed, a.percent_left, a.exact, a.active, a.resets_at, a.note
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
 
         *state.usage.lock().unwrap() = data.clone();
         let _ = app.emit("usage-updated", &data);
