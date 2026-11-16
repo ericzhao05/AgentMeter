@@ -19,16 +19,14 @@ const REFILL_MS = 2100;         // refill() glugs to 100% over ~2 s; then settle
 
 let settings = { tubeCount: 4, agents: [], demoMode: false, dockEdge: 'right' };
 let usage = [];
+let settingsKnown = false;   // don't render (or resize) until the real settings arrive
 const cols = new Map();         // agent id → { el, tube, last, refillTimer }
 const $ = id => document.getElementById(id);
 
-/* Which agents fill the tubes, in order. */
+/* Exactly the enabled agents, in order, up to tubeCount. First-run defaults are chosen by the backend;
+   in demo mode the same ids are matched to mock data (an id without a mock entry shows as unknown). */
 function chosenIds() {
-  const byId = new Set(usage.map(a => a.id));
-  let ids = [...settings.agents];
-  if (settings.demoMode) ids = ids.filter(id => byId.has(id)).concat(usage.map(a => a.id).filter(id => !ids.includes(id)));
-  else if (!ids.length) ids = usage.filter(a => a.installed).map(a => a.id);   // first run, before defaults are saved
-  return ids.slice(0, settings.tubeCount);
+  return settings.agents.slice(0, settings.tubeCount);
 }
 
 /* Measured in WKWebView (2x display): the blurred glow layers are the main GPU cost and are only skipped
@@ -90,6 +88,7 @@ function updateCol(id, c, a, glow) {
 }
 
 function render() {
+  if (!settingsKnown) return;
   const ids = chosenIds();
   const box = $('tubes'), glow = glowFor(ids.length);
   for (const [id, c] of cols) if (!ids.includes(id)) { clearTimeout(c.refillTimer); c.tube.destroy(); c.el.remove(); cols.delete(id); }
@@ -109,15 +108,20 @@ function render() {
 setInterval(() => document.querySelectorAll('.reset[data-iso]').forEach(el => { if (el.dataset.iso) el.textContent = formatReset(el.dataset.iso); }), 30000);
 
 $('settings').addEventListener('click', () => invoke('open_settings').catch(console.error));
+$('empty-settings').addEventListener('click', () => invoke('open_settings').catch(console.error));
 $('hide').addEventListener('click', () => appWindow.hide());
 // Drag the sidebar from anywhere except its buttons.
 $('panel').addEventListener('mousedown', e => {
   if (e.button === 0 && !e.target.closest('button')) appWindow.startDragging().catch(() => {});
 });
 
+// Listen first, then fetch the initial snapshots. A snapshot is applied only if no event for that
+// stream arrived after its request started (otherwise the event is newer and wins).
+let settingsRev = 0, usageRev = 0;
 (async () => {
-  await listen('usage-updated', e => { usage = e.payload; render(); });
-  await listen('settings-changed', e => { settings = e.payload; render(); });
-  [settings, usage] = await Promise.all([invoke('get_settings'), invoke('get_usage')]);
-  render();
+  await listen('usage-updated', e => { usageRev++; usage = e.payload; render(); });
+  await listen('settings-changed', e => { settingsRev++; settingsKnown = true; settings = e.payload; render(); });
+  const sRev = settingsRev, uRev = usageRev;
+  invoke('get_settings').then(s => { if (settingsRev === sRev) { settingsKnown = true; settings = s; render(); } }).catch(console.error);
+  invoke('get_usage').then(u => { if (usageRev === uRev) { usage = u; render(); } }).catch(console.error);
 })();
