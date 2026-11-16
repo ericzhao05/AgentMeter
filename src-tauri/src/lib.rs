@@ -278,6 +278,8 @@ fn toggle_sidebar(app: &AppHandle) {
         } else {
             let _ = w.show();
         }
+        #[cfg(debug_assertions)]
+        eprintln!("[agentmeter] sidebar visible={:?}", w.is_visible());
     }
 }
 
@@ -299,8 +301,15 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             "quit" => app.exit(0),
             _ => {}
         });
-    if let Some(icon) = app.default_window_icon() {
-        tray = tray.icon(icon.clone());
+    // Menu-bar glyph: a black+alpha template image that macOS tints for light/dark menu bars.
+    match tauri::image::Image::from_bytes(include_bytes!("../../assets/icons/tray-icon@2x.png")) {
+        Ok(icon) => tray = tray.icon(icon).icon_as_template(true),
+        Err(e) => {
+            eprintln!("[agentmeter] tray icon unreadable ({e}); using the app icon");
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+        }
     }
     tray.build(app)?;
     Ok(())
