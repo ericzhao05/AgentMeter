@@ -127,6 +127,15 @@ Limitation: the value is only as fresh as the last Codex turn.
      and calibrated budget are saved in the cache-dir JSON above. An app
      restart therefore neither re-hits the API early nor loses the reading.
      A corrupt file is ignored.
+     - Wall-clock values are bounded on every load and poll. A backoff more
+       than 1 h ahead is clamped to 1 h, and a reading dated more than 60 s
+       in the future counts as stale. A bad file or a clock jump can delay
+       fetching by at most 1 h.
+     - Saves write a temp file unique to the process and the write, fsync it,
+       then rename it into place. Two app instances never interleave writes.
+   - After a caller takes fetch ownership, it re-reads the state and re-checks
+     the backoff and TTL. A backoff started by a concurrent caller is never
+     bypassed.
 2. **Estimate fallback.** This runs when the API is unavailable (not logged in
    with a subscription, offline, HTTP error) and there is no usable last good
    reading. It is also used in `poll_all_at`, and is cached in memory for 60 s.

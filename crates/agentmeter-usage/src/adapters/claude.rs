@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
@@ -426,6 +426,20 @@ pub fn backoff_secs(failures: u32, jitter01: f64) -> i64 {
     exp.saturating_add(jitter).min(BACKOFF_CAP_SECS)
 }
 
+/// Allowed clock skew before a `fetched_at` in the future is distrusted.
+const FUTURE_SKEW_SECS: i64 = 60;
+
+/// Bound wall-clock values from disk or from before a clock change: no backoff
+/// can legitimately end more than `RETRY_AFTER_MAX_SECS` from now. Applied on
+/// every load and every poll, so a corrupt/forged file or a backwards clock
+/// jump can delay fetching by at most that cap.
+fn sanitize(st: &mut LiveState, now: DateTime<Utc>) {
+    let max = now + Duration::seconds(RETRY_AFTER_MAX_SECS);
+    if st.backoff_until.is_some_and(|b| b > max) {
+        st.backoff_until = Some(max);
+    }
+}
+
 fn note_reset(st: &mut LiveState, now: DateTime<Utc>) {
     if let Some(r) = st.last_good.as_ref().and_then(|g| g.resets_at).filter(|r| *r <= now) {
         if st.reset_seen_at.map_or(true, |seen| seen < r) {
@@ -440,6 +454,9 @@ pub fn should_fetch(st: &LiveState, now: DateTime<Utc>) -> bool {
         return false;
     }
     let Some(g) = &st.last_good else { return true };
+    if (g.fetched_at - now).num_seconds() > FUTURE_SKEW_SECS {
+        return true; // fetched "in the future": clock changed or bad file; don't trust its freshness
+    }
     if g.resets_at.is_some_and(|r| r <= now) {
         return true; // window reset since the reading: refresh promptly
     }
@@ -527,21 +544,39 @@ fn render(st: &LiveState, now: DateTime<Utc>, est: &mut dyn FnMut(Option<u64>) -
 }
 
 fn load_state(path: Option<&Path>) -> LiveState {
-    path.and_then(|p| fs::read_to_string(p).ok())
+    let mut st: LiveState = path
+        .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    sanitize(&mut st, Utc::now());
+    st
 }
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically replace the state file: write a temp file unique to this
+/// process and write (pid + counter, `create_new`) in the same directory,
+/// fsync it, then rename over the target. Concurrent writers (threads or app
+/// instances) never share a temp file, so the published file is always one
+/// complete write.
 fn save_state(path: Option<&Path>, st: &LiveState) {
+    use std::io::Write;
     let Some(p) = path else { return };
-    if let Some(dir) = p.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let tmp = p.with_extension("json.tmp");
-    if let Ok(s) = serde_json::to_string_pretty(st) {
-        if fs::write(&tmp, s).is_ok() {
-            let _ = fs::rename(&tmp, p);
-        }
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
+    let _ = fs::create_dir_all(dir);
+    let Ok(body) = serde_json::to_string_pretty(st) else { return };
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", name.to_string_lossy(), std::process::id(), n));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(body.as_bytes())?;
+            f.sync_all()
+        });
+    if written.is_err() || fs::rename(&tmp, p).is_err() {
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -550,11 +585,20 @@ pub(crate) struct Store {
     state: Mutex<Option<(Option<PathBuf>, LiveState)>>,
     in_flight: AtomicBool,
     est: Mutex<Option<(Instant, PathBuf, Option<u64>, Reading)>>,
+    /// Test hook run between the first eligibility check and taking flight ownership.
+    #[cfg(test)]
+    before_acquire: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Store {
     pub const fn new() -> Self {
-        Store { state: Mutex::new(None), in_flight: AtomicBool::new(false), est: Mutex::new(None) }
+        Store {
+            state: Mutex::new(None),
+            in_flight: AtomicBool::new(false),
+            est: Mutex::new(None),
+            #[cfg(test)]
+            before_acquire: Mutex::new(None),
+        }
     }
 
     #[cfg(test)]
@@ -631,12 +675,30 @@ fn cached_reading_with(store: &Store, ctx: &Ctx, fetch: LiveFetch, jitter01: f64
     let now = ctx.now;
     let path = ctx.cache_dir.as_ref().map(|d| d.join(STATE_FILE));
     let path = path.as_deref();
-    let mut st = store.snapshot(path);
-    note_reset(&mut st, now);
+    let current = |store: &Store| {
+        let mut st = store.snapshot(path);
+        sanitize(&mut st, now);
+        note_reset(&mut st, now);
+        st
+    };
+    let mut st = current(store);
+    #[cfg(test)]
+    if should_fetch(&st, now) {
+        let hook = store.before_acquire.lock().unwrap().take();
+        if let Some(h) = hook {
+            h();
+        }
+    }
     if should_fetch(&st, now)
         && store.in_flight.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
     {
         let _flight = InFlight(&store.in_flight);
+        // Another caller may have fetched (and e.g. started a backoff) between
+        // our first check and taking ownership: re-read and re-check.
+        st = current(store);
+        if !should_fetch(&st, now) {
+            return render(&st, now, &mut |limit| store.estimate(ctx, limit));
+        }
         let res = fetch(ctx);
         // Calibrate the estimate's token budget from the exact reading.
         let limit = match &res {
@@ -1086,6 +1148,87 @@ mod tests {
         });
         let r = cached_reading_with(&store, &ctx, &never, 0.0);
         assert_eq!(r.percent_left, Some(42.0));
+    }
+
+    #[test]
+    fn far_future_backoff_is_clamped() {
+        let d = home_with_claude();
+        let cache = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let st = LiveState { backoff_until: Some(now + Duration::days(3650)), failures: 3, ..Default::default() };
+        fs::write(cache.path().join(STATE_FILE), serde_json::to_string(&st).unwrap()).unwrap();
+        let store = Store::new();
+        let loaded = store.snapshot(Some(&cache.path().join(STATE_FILE)));
+        let until = loaded.backoff_until.unwrap();
+        assert!(until <= Utc::now() + Duration::seconds(RETRY_AFTER_MAX_SECS));
+        // So fetching resumes after at most the cap, not in ten years.
+        let r = cached_reading_with(
+            &store,
+            &live_ctx(d.path(), now + Duration::seconds(RETRY_AFTER_MAX_SECS + 5), Some(cache.path())),
+            &ok_reading(64.0, None),
+            0.0,
+        );
+        assert_eq!(r.percent_left, Some(64.0));
+        assert!(r.exact);
+
+        // Also bounded per poll (e.g. after the clock jumps backwards).
+        let mut st = LiveState { backoff_until: Some(now + Duration::days(1)), ..Default::default() };
+        sanitize(&mut st, now);
+        assert_eq!(st.backoff_until, Some(now + Duration::seconds(RETRY_AFTER_MAX_SECS)));
+    }
+
+    #[test]
+    fn future_fetched_at_is_stale() {
+        let now = t("2026-11-15T12:00:00Z");
+        let g = |fetched: DateTime<Utc>| GoodReading { percent_left: 50.0, resets_at: Some(t("2026-11-15T15:00:00Z")), fetched_at: fetched, note: String::new() };
+        let st = LiveState { last_good: Some(g(now + Duration::days(30))), ..Default::default() };
+        assert!(should_fetch(&st, now));
+        let st = LiveState { last_good: Some(g(now + Duration::seconds(30))), ..Default::default() };
+        assert!(!should_fetch(&st, now)); // small skew tolerated
+
+        let d = home_with_claude();
+        let store = Store::new_with(LiveState { last_good: Some(g(now + Duration::days(30))), ..Default::default() });
+        let r = cached_reading_with(&store, &live_ctx(d.path(), now, None), &ok_reading(20.0, None), 0.0);
+        assert_eq!(r.percent_left, Some(20.0));
+    }
+
+    #[test]
+    fn backoff_set_by_concurrent_caller_is_rechecked_after_acquire() {
+        use std::sync::Arc;
+        let d = home_with_claude();
+        let store = Arc::new(Store::new());
+        let now = t("2026-11-15T12:00:00Z");
+        let ctx = live_ctx(d.path(), now, None);
+        // Caller A passes the first check; before it takes ownership, caller B
+        // runs a full poll that gets a 429 and starts a backoff.
+        let (s2, c2) = (Arc::clone(&store), ctx.clone());
+        *store.before_acquire.lock().unwrap() = Some(Box::new(move || {
+            cached_reading_with(&s2, &c2, &rate_limited(Some("300")), 0.0);
+        }));
+        let r = cached_reading_with(&store, &ctx, &never, 0.0); // A must not fetch
+        assert!(r.note.contains("rate-limited"), "{}", r.note);
+        assert_eq!(store.snapshot(None).failures, 1);
+    }
+
+    #[test]
+    fn concurrent_saves_never_corrupt_or_leak_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        std::thread::scope(|s| {
+            for i in 0..8u32 {
+                let path = &path;
+                s.spawn(move || {
+                    for j in 0..25u32 {
+                        let st = LiveState { failures: i * 1000 + j, last_error: Some("x".repeat(2000)), ..Default::default() };
+                        save_state(Some(path), &st);
+                    }
+                });
+            }
+        });
+        let parsed: LiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.last_error.unwrap().len(), 2000);
+        let names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, [std::ffi::OsString::from(STATE_FILE)]);
     }
 
     #[test]
