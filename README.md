@@ -45,8 +45,9 @@ AgentMeter runs as a menu-bar app (no Dock icon). The tray menu has **Show/Hide 
 - **Hover:** the sidebar has no background, just tubes and labels. While the mouse is over it, a light
   grey panel and the ⚙︎ settings button appear.
 - **Move:** drag the sidebar anywhere and let go: dropped in the left half of a display it glides to
-  that display's left edge, in the right half to the right edge, and then slides out of view. The
-  edge and height are remembered across restarts.
+  that display's left edge, in the right half to the right edge, and then slides out of view. Edges
+  shared with another display are skipped (it docks to the outer edge instead). The edge and height
+  are remembered across restarts.
 - **Off entirely:** tray **Show/Hide Sidebar** turns edge reveal off; choose it again to turn it back on.
 - While hidden, the sidebar lets clicks through to the apps underneath and pauses its animation.
   With "Reduce motion" on, it appears and disappears without sliding.

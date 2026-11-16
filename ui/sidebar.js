@@ -105,7 +105,7 @@ function updateCol(id, c, a, glow) {
 
 /* "Couldn't read usage: Gemini, Cursor" — in the header when tubes are shown, as the whole content
    when none are; each agent's reason in the tooltip. */
-function renderNotice(unreadable, noTubes) {
+function renderNotice(unreadable, noTubes, tubes) {
   const names = unreadable.map(id => usage.find(a => a.id === id)?.name ?? id);
   const tip = unreadable.map(id => {
     const a = usage.find(x => x.id === id);
@@ -115,7 +115,8 @@ function renderNotice(unreadable, noTubes) {
   const text = names.length ? `Couldn't read usage: ${names.join(', ')}` : '';
   const notice = $('notice');
   notice.hidden = !text || noTubes;
-  notice.textContent = text;
+  // Narrow sidebars (1–2 tubes) get the shorter wording; it wraps to two lines, full list in the tooltip.
+  notice.textContent = tubes <= 2 && names.length ? `Unreadable: ${names.join(', ')}` : text;
   notice.title = tip;
   return { text, tip };
 }
@@ -132,7 +133,7 @@ function render() {
     updateCol(id, c, usage.find(a => a.id === id), glow);
   });
   window.tubeLoop.maxFps = ids.some(id => usage.find(a => a.id === id)?.active) ? FPS_ACTIVE : FPS_IDLE;
-  const n = renderNotice(unreadable, ids.length === 0);
+  const n = renderNotice(unreadable, ids.length === 0, ids.length);
   // Nothing to draw: either nothing is enabled, or nothing enabled is readable (then just the notice).
   const empty = $('empty');
   const allUnreadable = settings.agents.length > 0 && n.text;
@@ -170,7 +171,7 @@ function measureSlide(kind) {
   const report = () => {
     const gaps = times.slice(1).map((t, i) => t - times[i]);
     const max = Math.max(...gaps), slow = gaps.filter(g => g > 20).length;
-    invoke('dev_log', { msg: `slide ${kind}: ${gaps.length} frames, max gap ${max.toFixed(1)}ms, >20ms: ${slow}` }).catch(() => {});
+    invoke('dev_log', { msg: `slide ${kind}: ${gaps.length} frames, max gap ${max.toFixed(1)}ms at frame ${gaps.indexOf(max)}, >20ms: ${slow}` }).catch(() => {});
   };
   requestAnimationFrame(tick);
 }

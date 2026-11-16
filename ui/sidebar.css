@@ -25,17 +25,23 @@ body {
 @media (prefers-reduced-motion: reduce) { .panel { transition: none; } }
 
 /* Header (title, demo badge, gear) only appears on hover. */
-.bar > *:not(.notice) { opacity: 0; transition: opacity 150ms; }
+/* Hidden header items take no space, so the notice gets the full width until hover. */
+.bar > *:not(.notice) { display: none; }
 .bar button { pointer-events: none; }
-.panel.hover .bar > *:not(.notice) { opacity: 1; }
+.panel.hover .bar > *:not(.notice) { display: grid; }
+.panel.hover .bar > .title, .panel.hover .bar > .demo { display: block; }
+.panel.hover .bar > .demo[hidden] { display: none; }
 .panel.hover .bar button { pointer-events: auto; }
 .bar .title { text-shadow: 0 1px 2px rgba(0, 0, 0, .9); }
 
 /* "Couldn't read usage: …" — always visible while revealed (not hover-gated), one line in the header. */
 .bar .notice {
-  flex: 1 1 auto; min-width: 0; opacity: 1; font-size: 9.5px; color: #f3d9a4;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+  flex: 1 1 auto; min-width: 0; opacity: 1; font-size: 9.5px; line-height: 1.12; color: #f3d9a4;
+  /* up to two lines inside the 26px header, then an ellipsis (full text in the tooltip) */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
 }
+.bar .notice[hidden] { display: none; }
 .bar .notice:not([hidden]) ~ .title { display: none; }
 .empty #empty-text { color: #f3d9a4; }
 

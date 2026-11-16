@@ -28,7 +28,10 @@ const SIDEBAR_H: f64 = 382.0; // toolbar 26 + tube 280 + label 66 + bottom 10
 
 // Auto-hide: the sidebar lives flush against the right edge of its screen's work area and slides in
 // when the cursor touches that edge, out again once the cursor has left it for HIDE_AFTER.
-const EDGE_POLL: Duration = Duration::from_millis(90); // cursor check interval (cheap)
+const EDGE_POLL: Duration = Duration::from_millis(90); // cursor check interval near the edge
+const EDGE_POLL_FAR: Duration = Duration::from_millis(250); // ... when the cursor is far from it
+const FAR_FROM_EDGE: f64 = 200.0; // points; beyond this the slower poll is plenty
+const GEOM_REFRESH: Duration = Duration::from_secs(5); // re-read geometry (display changes)
 const EDGE_HIT: f64 = 3.0; // logical px from the right edge that count as "touching" it
 const EDGE_SLACK_Y: f64 = 40.0; // vertical slack above/below the sidebar for the edge hit
 const HIDE_AFTER: Duration = Duration::from_millis(600);
@@ -76,6 +79,11 @@ struct AppState {
     vis: Mutex<Visibility>,
     /// The window is gliding to its edge after a drop (its own Move events are not a new drag).
     gliding: AtomicBool,
+    /// Cached sidebar/screen geometry in global points (refreshed on window events), so the edge
+    /// watcher never has to call into the main thread.
+    geom: Mutex<Option<Geom>>,
+    /// The settings window is open (tracked from its window events).
+    settings_open: AtomicBool,
 }
 
 /// What the sidebar UI needs to know: slid in or out, and whether the cursor is over it.
@@ -315,6 +323,83 @@ fn snap_to_edge(w: &WebviewWindow, y: Option<f64>, edge: DockEdge) {
     }
 }
 
+/// Geometry in global *points* with a top-left origin (tao's logical desktop space). Every rect is
+/// converted with its own scale factor, so mixed-DPI setups (e.g. 2x built-in + 1x external) agree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geom {
+    /// Sidebar window rect (x, y, w, h).
+    win: (f64, f64, f64, f64),
+    /// Left / right edge of the screen the sidebar is on.
+    screen_left: f64,
+    screen_right: f64,
+    /// Height of the primary screen (flips NSEvent's bottom-left cursor origin).
+    primary_h: f64,
+}
+
+/// Physical rect → points, using that rect's own scale factor.
+fn to_points((x, y): (f64, f64), (w, h): (f64, f64), scale: f64) -> (f64, f64, f64, f64) {
+    (x / scale, y / scale, w / scale, h / scale)
+}
+
+/// NSEvent::mouseLocation (points, bottom-left origin, y up) → top-left origin points.
+fn flip_cursor((x, y): (f64, f64), primary_h: f64) -> (f64, f64) {
+    (x, primary_h - y)
+}
+
+fn monitor_points(m: &Monitor) -> (f64, f64, f64, f64) {
+    let (p, z) = (m.position(), m.size());
+    to_points((p.x as f64, p.y as f64), (z.width as f64, z.height as f64), m.scale_factor())
+}
+
+/// Cursor position in global points (thread-safe AppKit class query, no main-thread hop).
+#[cfg(target_os = "macos")]
+fn mouse_location() -> (f64, f64) {
+    let p = objc2_app_kit::NSEvent::mouseLocation();
+    (p.x, p.y)
+}
+#[cfg(not(target_os = "macos"))]
+fn mouse_location() -> (f64, f64) {
+    (f64::NAN, f64::NAN)
+}
+
+/// Re-read the sidebar's geometry (call on the main thread: window events, or via run_on_main_thread).
+fn refresh_geom(app: &AppHandle, st: &AppState) {
+    let Some(w) = app.get_webview_window(SIDEBAR) else { return };
+    let (Ok(p), Ok(z), Ok(sf), Some(m)) = (w.outer_position(), w.outer_size(), w.scale_factor(), monitor_for(&w)) else {
+        return;
+    };
+    let primary = w.primary_monitor().ok().flatten().unwrap_or_else(|| m.clone());
+    let (sx, _, sw, _) = monitor_points(&m);
+    let g = Geom {
+        win: to_points((p.x as f64, p.y as f64), (z.width as f64, z.height as f64), sf),
+        screen_left: sx,
+        screen_right: sx + sw,
+        primary_h: monitor_points(&primary).3,
+    };
+    *st.geom.lock().unwrap() = Some(g);
+}
+
+/// Only dock to an *outer* edge: if the chosen edge borders another display (level with the sidebar)
+/// the cursor would never stop there, so use the opposite edge when that one is free.
+fn outer_edge(edge: DockEdge, screen: (f64, f64, f64, f64), others: &[(f64, f64, f64, f64)], win_y: f64, win_h: f64) -> DockEdge {
+    let (sx, _, sw, _) = screen;
+    let neighbour = |e: DockEdge| {
+        others.iter().any(|&(ox, oy, ow, oh)| {
+            let level = oy < win_y + win_h && oy + oh > win_y;
+            level
+                && match e {
+                    DockEdge::Right => (ox - (sx + sw)).abs() < 2.0,
+                    DockEdge::Left => ((ox + ow) - sx).abs() < 2.0,
+                }
+        })
+    };
+    let other = match edge {
+        DockEdge::Right => DockEdge::Left,
+        DockEdge::Left => DockEdge::Right,
+    };
+    if neighbour(edge) && !neighbour(other) { other } else { edge }
+}
+
 fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<WebviewWindow> {
     let s = state.store.lock().unwrap().settings.clone();
     let width = sidebar_width(s.agents.len().clamp(1, settings::MAX_TUBES as usize) as u32);
@@ -337,6 +422,7 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
     // The edge comes from settings (dockEdge); only the vertical position is used from window.json.
     snap_to_edge(&w, settings::load_position(app).map(|(_, y)| y), s.dock_edge);
     w.show()?;
+    refresh_geom(app, state);
 
     // One long-lived thread, fed a tick per Move event. As soon as the button is released (checked
     // every 40 ms, so the release is caught quickly) the sidebar glides to the nearer edge.
@@ -361,6 +447,9 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
     let handle = app.clone();
     let st = state.clone();
     w.on_window_event(move |e| {
+        if matches!(e, WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }) {
+            refresh_geom(&handle, &st); // main thread: keeps the watcher's cached geometry current
+        }
         // Monitor / scale change (e.g. moved to another display, resolution changed): re-dock.
         // Never during a user drag: remember it and re-dock once the drag ends.
         if let WindowEvent::ScaleFactorChanged { .. } = e {
@@ -417,35 +506,26 @@ fn ease_out(t: f64) -> f64 {
 /// height, and let it slide out right away if the cursor isn't over it.
 fn finish_drag(app: &AppHandle, st: &Arc<AppState>) {
     let Some(w) = app.get_webview_window(SIDEBAR) else { return };
-    let (Some(m), Ok(sf), Ok(p), Ok(sz)) = (monitor_for(&w), w.scale_factor(), w.outer_position(), w.outer_size()) else {
-        return;
-    };
-    let (p, sz) = (p.to_logical::<f64>(sf), sz.to_logical::<f64>(sf));
-    let area = work_area(&m);
-    let edge = edge_for_drop(area, p.x, sz.width);
-    let (tx, ty) = docked_pos(area, sz.width, Some(p.y), edge);
-    let (dx, dy) = (tx - p.x, ty - p.y);
-    if dx.abs() >= 0.5 || dy.abs() >= 0.5 {
-        st.gliding.store(true, Ordering::SeqCst);
-        let t0 = Instant::now();
-        let (mut last, mut max_gap, mut steps) = (t0, Duration::ZERO, 0u32);
-        loop {
-            let t = t0.elapsed().as_secs_f64() / GLIDE.as_secs_f64();
-            let e = ease_out(t);
-            let _ = w.set_position(LogicalPosition::new(p.x + dx * e, p.y + dy * e));
-            steps += 1;
-            max_gap = max_gap.max(last.elapsed());
-            last = Instant::now();
-            if t >= 1.0 {
-                break;
-            }
-            std::thread::sleep(GLIDE_STEP);
+    let (edge, tx, ty) = loop {
+        let (Some(m), Ok(sf), Ok(p), Ok(sz)) = (monitor_for(&w), w.scale_factor(), w.outer_position(), w.outer_size()) else {
+            return;
+        };
+        let (p, sz) = (p.to_logical::<f64>(sf), sz.to_logical::<f64>(sf));
+        let area = work_area(&m);
+        let screen = monitor_points(&m);
+        let others: Vec<_> = w.available_monitors().unwrap_or_default().iter().map(monitor_points).filter(|r| *r != screen).collect();
+        let edge = outer_edge(edge_for_drop(area, p.x, sz.width), screen, &others, p.y, sz.height);
+        let (tx, ty) = docked_pos(area, sz.width, Some(p.y), edge);
+        if glide(&w, st, (p.x, p.y), (tx, ty), edge) {
+            break (edge, tx, ty);
         }
-        std::thread::sleep(Duration::from_millis(30)); // let the last Move events arrive
-        st.gliding.store(false, Ordering::SeqCst);
-        #[cfg(debug_assertions)]
-        eprintln!("[agentmeter] glide: {steps} steps in {:?}, max step gap {max_gap:?}, edge={edge:?}", t0.elapsed());
-    }
+        // A button went down mid-glide (re-grabbed): wait for the release, then start over from
+        // wherever the user left it.
+        while mouse_button_down() {
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
     settings::save_position(app, tx, ty);
     {
         let mut vis = st.vis.lock().unwrap();
@@ -461,7 +541,47 @@ fn finish_drag(app: &AppHandle, st: &Arc<AppState>) {
     }
 }
 
+/// Glide the window from `from` to `to` (ease-out). Returns false if cancelled because a mouse
+/// button went down (the user grabbed it again); true once it has arrived.
+fn glide(w: &WebviewWindow, st: &AppState, from: (f64, f64), to: (f64, f64), edge: DockEdge) -> bool {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    if dx.abs() < 0.5 && dy.abs() < 0.5 {
+        return true;
+    }
+    st.gliding.store(true, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let (mut last, mut max_gap, mut steps, mut done) = (t0, Duration::ZERO, 0u32, true);
+    loop {
+        if mouse_button_down() {
+            done = false;
+            break;
+        }
+        let t = t0.elapsed().as_secs_f64() / GLIDE.as_secs_f64();
+        let e = ease_out(t);
+        let _ = w.set_position(LogicalPosition::new(from.0 + dx * e, from.1 + dy * e));
+        steps += 1;
+        max_gap = max_gap.max(last.elapsed());
+        last = Instant::now();
+        if t >= 1.0 {
+            break;
+        }
+        std::thread::sleep(GLIDE_STEP);
+    }
+    std::thread::sleep(Duration::from_millis(30)); // let the last Move events arrive
+    st.gliding.store(false, Ordering::SeqCst);
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[agentmeter] glide{}: {steps} steps in {:?}, max step gap {max_gap:?}, edge={edge:?}",
+        if done { "" } else { " CANCELLED (re-grabbed)" },
+        t0.elapsed()
+    );
+    let _ = edge;
+    done
+}
+
 fn show_settings(app: &AppHandle) -> tauri::Result<()> {
+    let st = app.state::<Arc<AppState>>().inner().clone();
+    st.settings_open.store(true, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window(SETTINGS) {
         w.show()?;
         w.unminimize()?;
@@ -475,6 +595,11 @@ fn show_settings(app: &AppHandle) -> tauri::Result<()> {
         .center()
         .focused(true)
         .build()?;
+    w.on_window_event(move |e| {
+        if matches!(e, WindowEvent::Destroyed | WindowEvent::CloseRequested { .. }) {
+            st.settings_open.store(false, Ordering::SeqCst);
+        }
+    });
     w.set_focus()
 }
 
@@ -520,10 +645,7 @@ struct EdgeInput {
     cursor: (f64, f64),
     /// Sidebar window rect (x, y, w, h).
     win: (f64, f64, f64, f64),
-    /// Left / right edges of the sidebar's screen work area (where the sidebar docks).
-    work_left: f64,
-    work_right: f64,
-    /// Left / right edges of the whole screen (beyond the work area if the Dock is on that side).
+    /// Left / right edges of the whole screen (the physical edge the cursor can push against).
     screen_left: f64,
     screen_right: f64,
 }
@@ -533,9 +655,11 @@ fn at_reveal_edge(i: &EdgeInput, edge: DockEdge) -> bool {
     let (cx, cy) = i.cursor;
     let (_, wy, _, wh) = i.win;
     let level = cy >= wy - EDGE_SLACK_Y && cy <= wy + wh + EDGE_SLACK_Y;
+    // Only the physical screen edge counts (not a Dock-wide band), so resting on Dock icons can't
+    // trigger it.
     let at_edge = match edge {
-        DockEdge::Right => cx >= i.work_right - EDGE_HIT && cx <= i.screen_right.max(i.work_right) + 1.0,
-        DockEdge::Left => cx <= i.work_left + EDGE_HIT && cx >= i.screen_left.min(i.work_left) - 1.0,
+        DockEdge::Right => cx >= i.screen_right - EDGE_HIT && cx <= i.screen_right + 1.0,
+        DockEdge::Left => cx <= i.screen_left + EDGE_HIT && cx >= i.screen_left - 1.0,
     };
     level && at_edge
 }
@@ -546,58 +670,72 @@ fn cursor_inside(i: &EdgeInput) -> bool {
     cx >= wx - 2.0 && cx <= wx + ww + 2.0 && cy >= wy - 2.0 && cy <= wy + wh + 2.0
 }
 
-/// Background thread: ~11 cheap cursor checks per second drive reveal / hide / hover.
+/// Background thread driving reveal / hide / hover from the cursor position. It reads the cursor
+/// with an AppKit class query and the cached geometry, so it never wakes the main thread (except a
+/// geometry refresh every GEOM_REFRESH), and polls slower when the cursor is far from the edge.
 fn spawn_edge_watcher(app: AppHandle, state: Arc<AppState>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(EDGE_POLL);
-        let Some(w) = app.get_webview_window(SIDEBAR) else { continue };
-        if !state.vis.lock().unwrap().enabled {
-            continue;
-        }
-        let (Ok(cur), Ok(pos), Ok(size), Some(m)) = (app.cursor_position(), w.outer_position(), w.outer_size(), monitor_for(&w))
-        else {
-            continue;
-        };
-        // Physical → this monitor's logical points (cursor and window share the desktop space).
-        let sf = m.scale_factor();
-        let (ax, _, aw, _) = work_area(&m);
-        let input = EdgeInput {
-            cursor: (cur.x / sf, cur.y / sf),
-            win: (pos.x as f64 / sf, pos.y as f64 / sf, size.width as f64 / sf, size.height as f64 / sf),
-            work_left: ax,
-            work_right: ax + aw,
-            screen_left: m.position().x as f64 / sf,
-            screen_right: (m.position().x as f64 + m.size().width as f64) / sf,
-        };
-        let settings_open = app.get_webview_window(SETTINGS).is_some_and(|s| s.is_visible().unwrap_or(false));
-        let now = Instant::now();
-        let mut vis = state.vis.lock().unwrap();
-        if !vis.enabled {
-            continue;
-        }
-        let inside = cursor_inside(&input);
-        let mut ui = vis.ui;
-        if !ui.shown && !state.gliding.load(Ordering::SeqCst) && at_reveal_edge(&input, ui.edge) {
-            ui.shown = true;
-            vis.last_inside = now;
-        }
-        if ui.shown {
-            if inside {
+    std::thread::spawn(move || {
+        let mut interval = EDGE_POLL;
+        let mut refreshed = Instant::now();
+        loop {
+            std::thread::sleep(interval);
+            if refreshed.elapsed() >= GEOM_REFRESH {
+                refreshed = Instant::now();
+                let (h, st) = (app.clone(), state.clone());
+                let _ = app.run_on_main_thread(move || refresh_geom(&h, &st));
+            }
+            if !state.vis.lock().unwrap().enabled {
+                interval = EDGE_POLL_FAR;
+                continue;
+            }
+            let Some(g) = *state.geom.lock().unwrap() else { continue };
+            let input = EdgeInput {
+                cursor: flip_cursor(mouse_location(), g.primary_h),
+                win: g.win,
+                screen_left: g.screen_left,
+                screen_right: g.screen_right,
+            };
+            let Some(w) = app.get_webview_window(SIDEBAR) else { continue };
+            let now = Instant::now();
+            let mut vis = state.vis.lock().unwrap();
+            if !vis.enabled {
+                continue;
+            }
+            let edge = vis.ui.edge;
+            let over = cursor_inside(&input);
+            let in_zone = at_reveal_edge(&input, edge);
+            let mut ui = vis.ui;
+            if !ui.shown && !state.gliding.load(Ordering::SeqCst) && in_zone {
+                ui.shown = true;
                 vis.last_inside = now;
             }
-            let held = vis.reveal_until.is_some_and(|t| now < t)
-                || now.duration_since(vis.last_inside) < HIDE_AFTER
-                || mouse_button_down() // mid-drag (or clicking): never hide
-                || state.gliding.load(Ordering::SeqCst)
-                || settings_open;
-            if !held {
-                ui.shown = false;
-                vis.reveal_until = None;
+            if ui.shown {
+                if over || in_zone {
+                    vis.last_inside = now; // the reveal zone counts as "still there" (no flapping)
+                }
+                let held = vis.reveal_until.is_some_and(|t| now < t)
+                    || now.duration_since(vis.last_inside) < HIDE_AFTER
+                    || mouse_button_down() // mid-drag (or clicking): never hide
+                    || state.gliding.load(Ordering::SeqCst)
+                    || state.settings_open.load(Ordering::SeqCst);
+                if !held {
+                    ui.shown = false;
+                    vis.reveal_until = None;
+                }
             }
+            ui.hover = ui.shown && over;
+            set_ui(&app, &w, &mut vis, ui);
+            interval = if ui.shown || distance_to_edge(&input, edge) < FAR_FROM_EDGE { EDGE_POLL } else { EDGE_POLL_FAR };
         }
-        ui.hover = ui.shown && inside;
-        set_ui(&app, &w, &mut vis, ui);
     });
+}
+
+/// Horizontal distance from the cursor to the docked screen edge (points).
+fn distance_to_edge(i: &EdgeInput, edge: DockEdge) -> f64 {
+    match edge {
+        DockEdge::Right => (i.screen_right - i.cursor.0).abs(),
+        DockEdge::Left => (i.cursor.0 - i.screen_left).abs(),
+    }
 }
 
 /// Returns the menu + "Reset Settings" item when that item was added (settings writes blocked).
@@ -741,6 +879,8 @@ pub fn run() {
                 drag_seen: Mutex::new(None),
                 refit_after_drag: AtomicBool::new(false),
                 gliding: AtomicBool::new(false),
+                geom: Mutex::new(None),
+                settings_open: AtomicBool::new(false),
                 vis: Mutex::new(Visibility {
                     enabled: true,
                     ui: SidebarState { shown: true, hover: false, edge: dock_edge },
@@ -802,7 +942,7 @@ mod tests {
     }
 
     fn input(cx: f64, cy: f64) -> EdgeInput {
-        EdgeInput { cursor: (cx, cy), win: (1556.0, 300.0, 364.0, SIDEBAR_H), work_left: 0.0, work_right: 1920.0, screen_left: 0.0, screen_right: 1920.0 }
+        EdgeInput { cursor: (cx, cy), win: (1556.0, 300.0, 364.0, SIDEBAR_H), screen_left: 0.0, screen_right: 1920.0 }
     }
 
     #[test]
@@ -816,9 +956,43 @@ mod tests {
         assert!(!at_reveal_edge(&input(1919.0, 400.0), DockEdge::Left), "wrong edge for a left dock");
         assert!(at_reveal_edge(&input(0.5, 400.0), DockEdge::Left));
         assert!(!at_reveal_edge(&input(-30.0, 400.0), DockEdge::Left), "on a screen to the left");
-        // Dock on the right: the screen edge is past the work area; pushing against it still reveals.
-        let docked = EdgeInput { cursor: (1999.0, 400.0), win: (1500.0, 300.0, 364.0, SIDEBAR_H), work_left: 0.0, work_right: 1864.0, screen_left: 0.0, screen_right: 2000.0 };
-        assert!(at_reveal_edge(&docked, r));
+        // Dock on the right (work area ends at 1864, screen at 2000): only the physical edge reveals,
+        // resting on Dock icons does not.
+        let at = |cx| EdgeInput { cursor: (cx, 400.0), win: (1500.0, 300.0, 364.0, SIDEBAR_H), screen_left: 0.0, screen_right: 2000.0 };
+        assert!(at_reveal_edge(&at(1999.0), r));
+        assert!(!at_reveal_edge(&at(1866.0), r), "over the Dock, not at the screen edge");
+    }
+
+    #[test]
+    fn mixed_scale_geometry_lines_up() {
+        // Primary: built-in 2x, 1728x1117 points (3456x2234 px) at the origin. External 1x display to
+        // its right, 1920x1080 points. Sidebar docked at the external's right edge.
+        let primary_h = to_points((0.0, 0.0), (3456.0, 2234.0), 2.0).3;
+        let ext = to_points((1728.0, 0.0), (1920.0, 1080.0), 1.0);
+        let win = to_points((3370.0, 200.0), (278.0, SIDEBAR_H), 1.0);
+        assert_eq!(ext, (1728.0, 0.0, 1920.0, 1080.0));
+        // NSEvent reports (3640, 717) bottom-left => (3640, 400) top-left: over the sidebar.
+        let cursor = flip_cursor((3640.0, primary_h - 400.0), primary_h);
+        assert_eq!(cursor, (3640.0, 400.0));
+        let i = EdgeInput { cursor, win, screen_left: ext.0, screen_right: ext.0 + ext.2 };
+        assert!(cursor_inside(&i));
+        let edge = EdgeInput { cursor: (3647.5, 400.0), ..i };
+        assert!(at_reveal_edge(&edge, DockEdge::Right));
+        // The old approach (cursor scaled by the primary's 2x, divided by the sidebar's 1x) would
+        // have put the cursor at x=7280 — nowhere near the sidebar.
+        assert!(!cursor_inside(&EdgeInput { cursor: (7280.0, 800.0), ..i }));
+    }
+
+    #[test]
+    fn docks_only_to_outer_edges() {
+        let left = (0.0, 0.0, 1728.0, 1117.0);
+        let right = (1728.0, 0.0, 1920.0, 1080.0);
+        // Dropped in the right half of the left display: its right edge borders the other display.
+        assert_eq!(outer_edge(DockEdge::Right, left, &[right], 300.0, SIDEBAR_H), DockEdge::Left);
+        assert_eq!(outer_edge(DockEdge::Left, right, &[left], 300.0, SIDEBAR_H), DockEdge::Right);
+        assert_eq!(outer_edge(DockEdge::Right, right, &[left], 300.0, SIDEBAR_H), DockEdge::Right, "already outer");
+        // Neighbour not level with the sidebar (stacked lower): the edge is free there.
+        assert_eq!(outer_edge(DockEdge::Right, left, &[(1728.0, 1200.0, 1920.0, 1080.0)], 300.0, SIDEBAR_H), DockEdge::Right);
     }
 
     #[test]
