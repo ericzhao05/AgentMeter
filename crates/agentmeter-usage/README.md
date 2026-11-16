@@ -42,7 +42,9 @@ background thread or `spawn_blocking`, not from the main thread.
 state, and the calibrated token budget. It never contains credentials.
 
 `mock_all(t)`: Claude Code drains from 100% to 10% over 90 s and then resets to
-100%. Codex oscillates around 60%. Gemini stays low (6–13%). Cursor is
+100%. Percentages depend only on `t`. `resetsAt` is relative to the current
+wall clock, so countdown labels look realistic. Claude's demo cycle maps onto
+a 5-hour window. `mock_at(t, now)` is the fully deterministic variant. Codex oscillates around 60%. Gemini stays low (6–13%). Cursor is
 installed but unknown. opencode and aider are not installed.
 
 ```sh
@@ -108,8 +110,9 @@ Limitation: the value is only as fresh as the last Codex turn.
      and it rate-limits.
      - A good reading is reused for **5 min**. Within 10 minutes of a window
        reset, that drops to 60 s.
-     - Any failure starts a backoff. The adapter honours `Retry-After`
-       (seconds or HTTP-date, capped at 1 h). Without it, it waits
+     - Any failure starts a backoff of **at least 60 s**. The adapter honours
+       `Retry-After` (seconds or HTTP-date) but floors it at 60 s, so
+       `Retry-After: 0` doesn't mean "retry next poll", and caps it at 1 h. Without it, it waits
        60 s → 2 m → 4 m → 8 m → 15 m (cap), with up to +20% jitter.
      - **The API is never called during backoff.** Only one fetch runs at a
        time, and no lock is held during the Keychain or HTTP call.

@@ -1,6 +1,6 @@
 //! Deterministic demo data for UI development.
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::util::{rfc3339, round1};
 use crate::AgentUsage;
@@ -14,15 +14,22 @@ const CLAUDE_PERIOD: f64 = 90.0;
 /// * Gemini hovers low (~6–13%) to exercise the "low" state.
 /// * Cursor installed but unknown (`percent_left: None`).
 /// * opencode / aider not installed.
+///
+/// Percentages depend only on `t`. `resets_at` is relative to the current wall
+/// clock, so demo countdowns look realistic (Claude's maps its demo cycle onto
+/// a 5h window: full = ~5h to go, nearly empty = minutes to go).
 pub fn mock_all(t: f64) -> Vec<AgentUsage> {
+    mock_at(t, Utc::now())
+}
+
+/// [`mock_all`] with an explicit "now" (fully deterministic).
+pub fn mock_at(t: f64, now: DateTime<Utc>) -> Vec<AgentUsage> {
     let t = if t.is_finite() { t } else { 0.0 };
-    // Fixed epoch so resets_at is deterministic for a given t.
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let at = |secs: f64| rfc3339(base + Duration::milliseconds((secs * 1000.0) as i64));
+    let at = |secs: f64| rfc3339(now + Duration::seconds(secs.max(60.0) as i64));
 
     let phase = t.rem_euclid(CLAUDE_PERIOD) / CLAUDE_PERIOD; // 0..1
     let claude_left = round1(100.0 - 90.0 * phase);
-    let claude_reset = (t / CLAUDE_PERIOD).floor() * CLAUDE_PERIOD + CLAUDE_PERIOD;
+    let claude_reset = (1.0 - phase) * 5.0 * 3600.0;
 
     let codex_left = round1(60.0 + 25.0 * (t / 23.0).sin());
     let gemini_left = round1(9.5 + 3.5 * (t / 11.0).sin());
@@ -42,7 +49,7 @@ pub fn mock_all(t: f64) -> Vec<AgentUsage> {
     let mut x = AgentUsage::new("codex", "Codex");
     x.installed = true;
     x.percent_left = Some(codex_left);
-    x.resets_at = Some(at(t + 3600.0));
+    x.resets_at = Some(at(2.0 * 3600.0 + 3600.0 * (t / 41.0).cos()));
     x.window = Some("5h".into());
     x.active = (t / 13.0).cos() > 0.3;
     x.exact = true;
@@ -52,7 +59,7 @@ pub fn mock_all(t: f64) -> Vec<AgentUsage> {
     let mut g = AgentUsage::new("gemini", "Gemini CLI");
     g.installed = true;
     g.percent_left = Some(gemini_left);
-    g.resets_at = Some(at(t + 1800.0));
+    g.resets_at = Some(at(45.0 * 60.0 + 600.0 * (t / 17.0).sin()));
     g.window = Some("24h".into());
     g.active = false;
     g.exact = false;
@@ -79,9 +86,36 @@ mod tests {
 
     #[test]
     fn deterministic() {
-        let a = serde_json::to_string(&mock_all(42.5)).unwrap();
-        let b = serde_json::to_string(&mock_all(42.5)).unwrap();
+        let now = Utc::now();
+        let a = serde_json::to_string(&mock_at(42.5, now)).unwrap();
+        let b = serde_json::to_string(&mock_at(42.5, now)).unwrap();
         assert_eq!(a, b);
+        // Percentages don't depend on the wall clock.
+        let later = now + Duration::hours(3);
+        let p = |v: Vec<AgentUsage>| v.into_iter().map(|a| a.percent_left).collect::<Vec<_>>();
+        assert_eq!(p(mock_at(42.5, now)), p(mock_at(42.5, later)));
+    }
+
+    #[test]
+    fn resets_are_in_the_future_relative_to_now() {
+        // Whole-second "now" (resets_at is serialized at second precision).
+        let now = DateTime::parse_from_rfc3339("2026-11-15T12:00:00Z").unwrap().with_timezone(&Utc);
+        for i in 0..500 {
+            for a in mock_at(i as f64 * 0.7, now) {
+                if let Some(r) = a.resets_at {
+                    let r = DateTime::parse_from_rfc3339(&r).unwrap().with_timezone(&Utc);
+                    let secs = (r - now).num_seconds();
+                    assert!((60..=5 * 3600).contains(&secs), "{} resets in {secs}s", a.id);
+                }
+            }
+        }
+        // Claude: ~5h to go when full, minutes to go when nearly drained.
+        let reset = |t: f64| {
+            let r = mock_at(t, now)[0].resets_at.clone().unwrap();
+            (DateTime::parse_from_rfc3339(&r).unwrap().with_timezone(&Utc) - now).num_seconds()
+        };
+        assert!(reset(0.0) > 4 * 3600);
+        assert!(reset(89.0) < 30 * 60);
     }
 
     #[test]
