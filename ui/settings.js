@@ -12,7 +12,12 @@
  *   AgentUsage = { id, name, installed, percentLeft: number|null, resetsAt, window, active, exact, note }
  *
  * Behaviour notes for integrators:
- *   - Every change is saved immediately (no Save button), and a "Saved" pill confirms it.
+ *   - Controls are inert until the first get_settings succeeds (Retry banner if it fails), so an early
+ *     click can never save defaults over the user's settings.
+ *   - Every change is saved immediately (no Save button), and a "Saved" pill confirms it. Saves are
+ *     single-flight, latest wins; once the queue drains the page re-reads get_settings as the truth.
+ *   - Event listeners are registered before the initial reads; a settings-changed that races a read
+ *     (or arrives mid-save) triggers a re-read instead of being dropped.
  *   - settings.agents holds ALL enabled agents in order, and can be longer than tubeCount.
  *     The sidebar should show the first tubeCount of them; the rest are marked "not shown" here.
  *   - Unknown keys on the Settings object are preserved on save.
@@ -21,6 +26,8 @@
  *   - Keyboard: focus a row's grip and press ArrowUp/ArrowDown, or use the arrow buttons.
  *   - Opened in a normal browser (no window.__TAURI__), a mock backend is used: sample agents, and settings
  *     kept in localStorage under "agentmeter.settings". Usage drifts every few seconds to exercise live updates.
+ *     Test hooks: URL params mockLoadDelay, mockSaveDelay (ms), mockFailLoad, mockFailSave (count), and
+ *     window.__agentmeterMock.{failNextSaves, failNextLoads, setSaveDelay, setLoadDelay, externalChange}.
  */
 (() => {
   'use strict';
@@ -89,17 +96,43 @@
       for (const u of usage) if (u.percentLeft != null) u.percentLeft = Math.max(0, Math.min(100, u.percentLeft + (Math.random() * 6 - 4)));
       emit('usage-updated', usage.map(u => ({ ...u })));
     }, 4000);
-    const delay = v => new Promise(r => setTimeout(() => r(v), 60));
+    // Test knobs. URL params apply from page load (e.g. settings.html?mockLoadDelay=2000&mockFailLoad=1);
+    // window.__agentmeterMock changes them at runtime from the console.
+    const params = new URLSearchParams(location.search);
+    const knobs = {
+      loadDelay: +params.get('mockLoadDelay') || 60,
+      saveDelay: +params.get('mockSaveDelay') || 60,
+      failLoads: +params.get('mockFailLoad') || 0,   // number of get_settings calls to fail
+      failSaves: +params.get('mockFailSave') || 0,   // number of save_settings calls to fail
+    };
+    const after = (ms, fn) => new Promise((res, rej) => setTimeout(() => { try { res(fn()); } catch (e) { rej(e); } }, ms));
+    window.__agentmeterMock = {
+      knobs,
+      failNextSaves(n = 1) { knobs.failSaves = n; },
+      failNextLoads(n = 1) { knobs.failLoads = n; },
+      setSaveDelay(ms) { knobs.saveDelay = ms; },
+      setLoadDelay(ms) { knobs.loadDelay = ms; },
+      // Simulates the tray or sidebar changing settings: persists, then emits settings-changed.
+      externalChange(patch) {
+        localStorage.setItem(KEY, JSON.stringify(normalize({ ...read(), ...patch })));
+        emit('settings-changed', read());
+      },
+      read,
+    };
     return {
       mock: true,
       invoke(cmd, args) {
-        if (cmd === 'get_settings') return delay(read());
-        if (cmd === 'get_usage') return delay(usage.map(u => ({ ...u })));
-        if (cmd === 'save_settings') {
+        if (cmd === 'get_settings') return after(knobs.loadDelay, () => {
+          if (knobs.failLoads > 0) { knobs.failLoads--; throw new Error('mock: get_settings failed'); }
+          return read();
+        });
+        if (cmd === 'get_usage') return after(60, () => usage.map(u => ({ ...u })));
+        if (cmd === 'save_settings') return after(knobs.saveDelay, () => {
+          if (knobs.failSaves > 0) { knobs.failSaves--; throw new Error('mock: save_settings failed'); }
           localStorage.setItem(KEY, JSON.stringify(args.settings));
           setTimeout(() => emit('settings-changed', read()), 0);
-          return delay(null);
-        }
+          return null;
+        });
         return Promise.reject(new Error('mock: unknown command ' + cmd));
       },
       listen(evt, cb) {
@@ -110,10 +143,12 @@
   }
 
   /* ===== State ===== */
-  let settings = normalize(DEFAULT_SETTINGS);
+  let settings = normalize({ ...DEFAULT_SETTINGS, agents: [] });   // placeholder until get_settings resolves
   let usage = [];
-  let pendingSaves = 0;
-  let saveChain = Promise.resolve();
+  let ready = false;          // controls stay inert until the first get_settings succeeds
+  let saving = false;         // a save (or the post-save reconcile read) is in flight
+  let pendingSave = null;     // latest unsaved snapshot; newer edits replace it ("latest wins")
+  let externalSeq = 0;        // bumped on every settings-changed event, to detect events racing a read
   let drag = null;
   let renderQueued = false;
 
@@ -139,28 +174,61 @@
 
   /* ===== Saving ===== */
   let statusTimer = 0;
-  function showStatus(text, isError) {
+  function showStatus(text, isError, sticky) {
     clearTimeout(statusTimer);
     els.status.textContent = text;
     els.status.classList.toggle('error', !!isError);
     els.status.classList.add('show');
-    statusTimer = setTimeout(() => els.status.classList.remove('show'), isError ? 4000 : 1400);
+    if (!sticky) statusTimer = setTimeout(() => els.status.classList.remove('show'), isError ? 4000 : 1400);
+  }
+
+  const sameSettings = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  // Reads settings, re-reading if a settings-changed event arrived while the read was in flight
+  // (the read may predate that change). Bounded so a chatty backend cannot spin us forever.
+  async function readSettingsSettled() {
+    for (let i = 0; ; i++) {
+      const seq = externalSeq;
+      const s = normalize(await backend.invoke('get_settings'));
+      if (seq === externalSeq || i >= 3) return s;
+    }
   }
 
   function commit(patch) {
+    if (!ready) return;
     settings = normalize({ ...settings, ...patch });
     render();
-    const snapshot = JSON.parse(JSON.stringify(settings));
-    pendingSaves++;
-    saveChain = saveChain
-      .then(() => backend.invoke('save_settings', { settings: snapshot }))
-      .then(() => { if (pendingSaves === 1) showStatus('Saved'); })
-      .catch(err => {
-        console.error('save_settings failed', err);
-        showStatus("Couldn't save", true);
-        return backend.invoke('get_settings').then(s => { settings = normalize(s); render(); }).catch(() => {});
-      })
-      .finally(() => { pendingSaves--; });
+    pendingSave = JSON.parse(JSON.stringify(settings));
+    pump();
+  }
+
+  // Single-flight save queue: at most one save in flight plus one pending snapshot (latest wins).
+  // When it drains, success or failure, the backend's settings are re-read and shown as the truth,
+  // unless the user edited again meanwhile, in which case that edit is saved first.
+  async function pump() {
+    if (saving) return;
+    saving = true;
+    let failed = false;
+    while (pendingSave) {
+      const snap = pendingSave;
+      pendingSave = null;
+      try { await backend.invoke('save_settings', { settings: snap }); }
+      catch (err) { failed = true; console.error('save_settings failed', err); }
+    }
+    let fresh = null;
+    try { fresh = await readSettingsSettled(); } catch (err) { console.error('get_settings after save failed', err); }
+    saving = false;
+    if (pendingSave) { pump(); return; }
+    if (fresh && !sameSettings(fresh, settings)) { settings = fresh; render(); }
+    showStatus(failed ? "Couldn't save" : 'Saved', failed);
+  }
+
+  function onSettingsChanged(payload) {
+    externalSeq++;
+    // Before init, or while a save is draining, the reconcile read in init()/pump() picks this up.
+    if (!ready || saving) return;
+    const next = normalize(payload);
+    if (!sameSettings(next, settings)) { settings = next; render(); }
   }
 
   const announce = msg => { els.announcer.textContent = ''; requestAnimationFrame(() => { els.announcer.textContent = msg; }); };
@@ -394,24 +462,49 @@
   els.agents.addEventListener('lostpointercapture', e => { if (drag) endDrag(e); });
 
   /* ===== Startup ===== */
+  const main = document.querySelector('main');
+  const loadError = $('load-error');
+  function setReady(on) {
+    ready = on;
+    main.inert = !on;                      // blocks clicks, focus and keyboard on every control
+    main.setAttribute('aria-busy', String(!on));
+    document.body.classList.toggle('loading', !on);
+  }
+
+  async function loadSettings() {
+    loadError.hidden = true;
+    showStatus('Loading…', false, true);
+    try {
+      settings = await readSettingsSettled();
+    } catch (err) {
+      console.error('get_settings failed', err);
+      els.status.classList.remove('show');
+      els.status.textContent = '';
+      loadError.hidden = false;
+      return;
+    }
+    setReady(true);
+    els.status.classList.remove('show');
+    els.status.textContent = '';
+    render();
+  }
+
   async function init() {
     if (backend.mock) document.documentElement.dataset.mock = 'true';
+    setReady(false);
     render();
+    // Listen first so nothing emitted during the initial reads is lost. Usage simply takes whichever
+    // arrives last (event or read); settings events bump externalSeq, which makes the read retry.
     try {
-      const [s, u] = await Promise.all([backend.invoke('get_settings'), backend.invoke('get_usage')]);
-      settings = normalize(s);
-      usage = Array.isArray(u) ? u : [];
-    } catch (err) {
-      console.error('initial load failed', err);
-      showStatus("Couldn't load settings", true);
-    }
-    render();
-    backend.listen('usage-updated', e => { if (Array.isArray(e.payload)) { usage = e.payload; render(); } });
-    backend.listen('settings-changed', e => {
-      if (pendingSaves > 0) return;                       // our own save is in flight; it is the source of truth
-      const next = normalize(e.payload);
-      if (JSON.stringify(next) !== JSON.stringify(settings)) { settings = next; render(); }
-    });
+      await Promise.all([
+        backend.listen('usage-updated', e => { if (Array.isArray(e.payload)) { usage = e.payload; render(); } }),
+        backend.listen('settings-changed', e => onSettingsChanged(e.payload)),
+      ]);
+    } catch (err) { console.error('event listen failed', err); }
+    backend.invoke('get_usage').then(u => { if (Array.isArray(u)) { usage = u; render(); } })
+      .catch(err => console.error('get_usage failed', err));
+    await loadSettings();
   }
+  $('load-retry').addEventListener('click', loadSettings);
   init();
 })();
