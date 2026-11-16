@@ -3,7 +3,7 @@ mod settings;
 use agentmeter_usage as usage;
 
 use serde::Serialize;
-use settings::Settings;
+use settings::{DockEdge, Settings};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,8 @@ const EDGE_HIT: f64 = 3.0; // logical px from the right edge that count as "touc
 const EDGE_SLACK_Y: f64 = 40.0; // vertical slack above/below the sidebar for the edge hit
 const HIDE_AFTER: Duration = Duration::from_millis(600);
 const LAUNCH_REVEAL: Duration = Duration::from_secs(2); // brief reveal on launch / tray Show
+const GLIDE: Duration = Duration::from_millis(220); // drop → edge glide (ease-out)
+const GLIDE_STEP: Duration = Duration::from_millis(8); // ~120 Hz position steps
 
 /// Settings plus the first-run flag behind ONE mutex. Every settings write holds it across
 /// update + persist + emit, so there is a single persistence owner and writes can't interleave.
@@ -72,6 +74,8 @@ struct AppState {
     refit_after_drag: AtomicBool,
     /// Auto-hide state of the sidebar (see `spawn_edge_watcher`).
     vis: Mutex<Visibility>,
+    /// The window is gliding to its edge after a drop (its own Move events are not a new drag).
+    gliding: AtomicBool,
 }
 
 /// What the sidebar UI needs to know: slid in or out, and whether the cursor is over it.
@@ -80,6 +84,8 @@ struct AppState {
 struct SidebarState {
     shown: bool,
     hover: bool,
+    /// Which screen edge it is docked to (slide direction, header layout).
+    edge: DockEdge,
 }
 
 struct Visibility {
@@ -244,7 +250,8 @@ fn resize_sidebar(window: WebviewWindow, state: tauri::State<'_, Arc<AppState>>,
         }
         return Ok(());
     }
-    snap_to_edge(&window, None);
+    let edge = state.vis.lock().unwrap().ui.edge;
+    snap_to_edge(&window, None, edge);
     Ok(())
 }
 
@@ -255,6 +262,14 @@ fn drag_began(state: tauri::State<'_, Arc<AppState>>) {
 }
 
 // ---------- windows ----------
+
+/// Debug builds: lets the sidebar report measurements (e.g. slide frame timing) to stderr.
+#[tauri::command]
+fn dev_log(msg: String) {
+    #[cfg(debug_assertions)]
+    eprintln!("[agentmeter/ui] {msg}");
+    let _ = msg;
+}
 
 #[tauri::command]
 fn get_sidebar_state(state: tauri::State<'_, Arc<AppState>>) -> SidebarState {
@@ -272,20 +287,29 @@ fn work_area(m: &Monitor) -> (f64, f64, f64, f64) {
     (a.position.x as f64 / s, a.position.y as f64 / s, a.size.width as f64 / s, a.size.height as f64 / s)
 }
 
-/// Docked position: flush with the right edge of `area`, `y` clamped into it (None = centred).
-fn docked_pos((ax, ay, aw, ah): (f64, f64, f64, f64), width: f64, y: Option<f64>) -> (f64, f64) {
+/// Docked position: flush with the left/right edge of `area`, `y` clamped into it (None = centred).
+fn docked_pos((ax, ay, aw, ah): (f64, f64, f64, f64), width: f64, y: Option<f64>, edge: DockEdge) -> (f64, f64) {
     let y = y.unwrap_or(ay + (ah - SIDEBAR_H) / 2.0);
-    (ax + aw - width, y.min(ay + ah - SIDEBAR_H).max(ay))
+    let x = match edge {
+        DockEdge::Right => ax + aw - width,
+        DockEdge::Left => ax,
+    };
+    (x, y.min(ay + ah - SIDEBAR_H).max(ay))
 }
 
-/// Put the sidebar flush against the right edge of the screen it is on, keeping its vertical
-/// position (or `y`), clamped to the work area. A window on no screen lands on the primary one.
-fn snap_to_edge(w: &WebviewWindow, y: Option<f64>) {
+/// Which edge a sidebar dropped at x (width w) belongs to: the half of the screen its centre is in.
+fn edge_for_drop((ax, _, aw, _): (f64, f64, f64, f64), x: f64, w: f64) -> DockEdge {
+    if x + w / 2.0 < ax + aw / 2.0 { DockEdge::Left } else { DockEdge::Right }
+}
+
+/// Put the sidebar flush against an edge of the screen it is on, keeping its vertical position
+/// (or `y`), clamped to the work area. A window on no screen lands on the primary one.
+fn snap_to_edge(w: &WebviewWindow, y: Option<f64>, edge: DockEdge) {
     let Some(m) = monitor_for(w) else { return };
     let s = w.scale_factor().unwrap_or(1.0);
     let cur = w.outer_position().ok().map(|p| p.to_logical::<f64>(s));
     let width = w.outer_size().map(|z| z.to_logical::<f64>(s).width).unwrap_or(COL_W);
-    let (x, y) = docked_pos(work_area(&m), width, y.or(cur.map(|c| c.y)));
+    let (x, y) = docked_pos(work_area(&m), width, y.or(cur.map(|c| c.y)), edge);
     if cur.is_none_or(|c| (c.x - x).abs() >= 0.5 || (c.y - y).abs() >= 0.5) {
         let _ = w.set_position(LogicalPosition::new(x, y));
     }
@@ -310,36 +334,29 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
         .visible(false)
         .build()?;
 
-    // Only the vertical position is remembered; it is always docked to the right edge.
-    snap_to_edge(&w, settings::load_position(app).map(|(_, y)| y));
+    // The edge comes from settings (dockEdge); only the vertical position is used from window.json.
+    snap_to_edge(&w, settings::load_position(app).map(|(_, y)| y), s.dock_edge);
     w.show()?;
 
-    // One long-lived thread, fed a tick per Move event: once moves are quiet and no button is held
-    // (the drag is over), snap back to the right edge and remember the vertical position.
+    // One long-lived thread, fed a tick per Move event. As soon as the button is released (checked
+    // every 40 ms, so the release is caught quickly) the sidebar glides to the nearer edge.
     let (move_tx, move_rx) = mpsc::channel::<()>();
     let saver = app.clone();
+    let st_saver = state.clone();
     std::thread::spawn(move || loop {
         if move_rx.recv().is_err() {
             return;
         }
         loop {
-            match move_rx.recv_timeout(DRAG_QUIET + Duration::from_millis(50)) {
+            match move_rx.recv_timeout(Duration::from_millis(40)) {
                 Ok(()) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) if mouse_button_down() => continue, // paused mid-drag
+                Err(mpsc::RecvTimeoutError::Timeout) if mouse_button_down() => continue, // still dragging
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
-        let h = saver.clone();
-        let _ = saver.run_on_main_thread(move || {
-            if let Some(w) = h.get_webview_window(SIDEBAR) {
-                snap_to_edge(&w, None);
-                if let (Ok(p), Ok(sf)) = (w.outer_position(), w.scale_factor()) {
-                    let p = p.to_logical::<f64>(sf);
-                    settings::save_position(&h, p.x, p.y);
-                }
-            }
-        });
+        finish_drag(&saver, &st_saver);
+        while move_rx.try_recv().is_ok() {} // the glide's own Move events
     });
     let handle = app.clone();
     let st = state.clone();
@@ -356,8 +373,10 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
             }
         }
         if let WindowEvent::Moved(_) = e {
-            *st.drag_seen.lock().unwrap() = Some(Instant::now()); // every move renews the marker
-            let _ = move_tx.send(());
+            if !st.gliding.load(Ordering::SeqCst) {
+                *st.drag_seen.lock().unwrap() = Some(Instant::now()); // every move renews the marker
+                let _ = move_tx.send(());
+            }
         }
     });
     Ok(w)
@@ -383,7 +402,62 @@ fn schedule_refit(app: AppHandle, st: Arc<AppState>) {
 /// Re-dock the sidebar on the right edge of its current screen (after a scale/monitor change).
 fn refit_sidebar(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(SIDEBAR) {
-        snap_to_edge(&w, None);
+        let edge = app.state::<Arc<AppState>>().vis.lock().unwrap().ui.edge;
+        snap_to_edge(&w, None, edge);
+    }
+}
+
+/// Ease-out cubic.
+fn ease_out(t: f64) -> f64 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Drag released: pick the edge from the half of the screen the sidebar was dropped in, glide the
+/// window there in one continuous ease-out motion (instead of an instant jump), remember edge +
+/// height, and let it slide out right away if the cursor isn't over it.
+fn finish_drag(app: &AppHandle, st: &Arc<AppState>) {
+    let Some(w) = app.get_webview_window(SIDEBAR) else { return };
+    let (Some(m), Ok(sf), Ok(p), Ok(sz)) = (monitor_for(&w), w.scale_factor(), w.outer_position(), w.outer_size()) else {
+        return;
+    };
+    let (p, sz) = (p.to_logical::<f64>(sf), sz.to_logical::<f64>(sf));
+    let area = work_area(&m);
+    let edge = edge_for_drop(area, p.x, sz.width);
+    let (tx, ty) = docked_pos(area, sz.width, Some(p.y), edge);
+    let (dx, dy) = (tx - p.x, ty - p.y);
+    if dx.abs() >= 0.5 || dy.abs() >= 0.5 {
+        st.gliding.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let (mut last, mut max_gap, mut steps) = (t0, Duration::ZERO, 0u32);
+        loop {
+            let t = t0.elapsed().as_secs_f64() / GLIDE.as_secs_f64();
+            let e = ease_out(t);
+            let _ = w.set_position(LogicalPosition::new(p.x + dx * e, p.y + dy * e));
+            steps += 1;
+            max_gap = max_gap.max(last.elapsed());
+            last = Instant::now();
+            if t >= 1.0 {
+                break;
+            }
+            std::thread::sleep(GLIDE_STEP);
+        }
+        std::thread::sleep(Duration::from_millis(30)); // let the last Move events arrive
+        st.gliding.store(false, Ordering::SeqCst);
+        #[cfg(debug_assertions)]
+        eprintln!("[agentmeter] glide: {steps} steps in {:?}, max step gap {max_gap:?}, edge={edge:?}", t0.elapsed());
+    }
+    settings::save_position(app, tx, ty);
+    {
+        let mut vis = st.vis.lock().unwrap();
+        vis.last_inside = Instant::now() - HIDE_AFTER; // hide on the next tick unless the cursor is over it
+        let ui = SidebarState { edge, ..vis.ui };
+        set_ui(app, &w, &mut vis, ui);
+    }
+    let current = st.store.lock().unwrap().settings.clone();
+    if current.dock_edge != edge {
+        if let Err(e) = persist(app, st, Settings { dock_edge: edge, ..current }) {
+            eprintln!("[agentmeter] could not save dock edge: {e}");
+        }
     }
 }
 
@@ -426,14 +500,16 @@ fn toggle_sidebar(app: &AppHandle) {
     let mut vis = state.vis.lock().unwrap();
     if vis.enabled {
         vis.enabled = false;
-        set_ui(app, &w, &mut vis, SidebarState { shown: false, hover: false });
+        let edge = vis.ui.edge;
+        set_ui(app, &w, &mut vis, SidebarState { shown: false, hover: false, edge });
         let _ = w.hide();
     } else {
         vis.enabled = true;
         vis.reveal_until = Some(Instant::now() + LAUNCH_REVEAL);
         vis.last_inside = Instant::now();
         let _ = w.show();
-        set_ui(app, &w, &mut vis, SidebarState { shown: true, hover: false });
+        let edge = vis.ui.edge;
+        set_ui(app, &w, &mut vis, SidebarState { shown: true, hover: false, edge });
     }
     #[cfg(debug_assertions)]
     eprintln!("[agentmeter] sidebar enabled={}", vis.enabled);
@@ -444,17 +520,24 @@ struct EdgeInput {
     cursor: (f64, f64),
     /// Sidebar window rect (x, y, w, h).
     win: (f64, f64, f64, f64),
-    /// Right edge of the sidebar's screen work area (where the sidebar is docked).
-    edge_x: f64,
-    /// Right edge of the whole screen (beyond edge_x if the Dock sits on the right).
+    /// Left / right edges of the sidebar's screen work area (where the sidebar docks).
+    work_left: f64,
+    work_right: f64,
+    /// Left / right edges of the whole screen (beyond the work area if the Dock is on that side).
+    screen_left: f64,
     screen_right: f64,
 }
 
-/// Is the cursor touching the right edge, level with the sidebar (with some vertical slack)?
-fn at_reveal_edge(i: &EdgeInput) -> bool {
+/// Is the cursor touching the docked screen edge, level with the sidebar (some vertical slack)?
+fn at_reveal_edge(i: &EdgeInput, edge: DockEdge) -> bool {
     let (cx, cy) = i.cursor;
     let (_, wy, _, wh) = i.win;
-    cx >= i.edge_x - EDGE_HIT && cx <= i.screen_right.max(i.edge_x) + 1.0 && cy >= wy - EDGE_SLACK_Y && cy <= wy + wh + EDGE_SLACK_Y
+    let level = cy >= wy - EDGE_SLACK_Y && cy <= wy + wh + EDGE_SLACK_Y;
+    let at_edge = match edge {
+        DockEdge::Right => cx >= i.work_right - EDGE_HIT && cx <= i.screen_right.max(i.work_right) + 1.0,
+        DockEdge::Left => cx <= i.work_left + EDGE_HIT && cx >= i.screen_left.min(i.work_left) - 1.0,
+    };
+    level && at_edge
 }
 
 fn cursor_inside(i: &EdgeInput) -> bool {
@@ -481,7 +564,9 @@ fn spawn_edge_watcher(app: AppHandle, state: Arc<AppState>) {
         let input = EdgeInput {
             cursor: (cur.x / sf, cur.y / sf),
             win: (pos.x as f64 / sf, pos.y as f64 / sf, size.width as f64 / sf, size.height as f64 / sf),
-            edge_x: ax + aw,
+            work_left: ax,
+            work_right: ax + aw,
+            screen_left: m.position().x as f64 / sf,
             screen_right: (m.position().x as f64 + m.size().width as f64) / sf,
         };
         let settings_open = app.get_webview_window(SETTINGS).is_some_and(|s| s.is_visible().unwrap_or(false));
@@ -492,7 +577,7 @@ fn spawn_edge_watcher(app: AppHandle, state: Arc<AppState>) {
         }
         let inside = cursor_inside(&input);
         let mut ui = vis.ui;
-        if !ui.shown && at_reveal_edge(&input) {
+        if !ui.shown && !state.gliding.load(Ordering::SeqCst) && at_reveal_edge(&input, ui.edge) {
             ui.shown = true;
             vis.last_inside = now;
         }
@@ -503,6 +588,7 @@ fn spawn_edge_watcher(app: AppHandle, state: Arc<AppState>) {
             let held = vis.reveal_until.is_some_and(|t| now < t)
                 || now.duration_since(vis.last_inside) < HIDE_AFTER
                 || mouse_button_down() // mid-drag (or clicking): never hide
+                || state.gliding.load(Ordering::SeqCst)
                 || settings_open;
             if !held {
                 ui.shown = false;
@@ -627,7 +713,8 @@ pub fn run() {
             open_settings,
             resize_sidebar,
             drag_began,
-            get_sidebar_state
+            get_sidebar_state,
+            dev_log
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -636,6 +723,7 @@ pub fn run() {
             let handle = app.handle().clone();
             let demo = demo_from_env();
             let mut loaded = settings::load(&handle);
+            let dock_edge = loaded.settings.dock_edge;
             let file_demo_mode = loaded.settings.demo_mode;
             loaded.settings.demo_mode = demo; // legacy field: in memory it reflects the env var
             let (tx, rx) = mpsc::channel();
@@ -652,9 +740,10 @@ pub fn run() {
                 reset_item: Mutex::new(None),
                 drag_seen: Mutex::new(None),
                 refit_after_drag: AtomicBool::new(false),
+                gliding: AtomicBool::new(false),
                 vis: Mutex::new(Visibility {
                     enabled: true,
-                    ui: SidebarState { shown: true, hover: false },
+                    ui: SidebarState { shown: true, hover: false, edge: dock_edge },
                     last_inside: Instant::now(),
                     reveal_until: Some(Instant::now() + LAUNCH_REVEAL),
                 }),
@@ -684,28 +773,52 @@ mod tests {
     #[test]
     fn docks_flush_right_and_clamps_vertically() {
         let area = (0.0, 25.0, 1440.0, 875.0);
-        assert_eq!(docked_pos(area, 364.0, Some(300.0)), (1076.0, 300.0));
-        assert_eq!(docked_pos(area, 364.0, Some(800.0)), (1076.0, 25.0 + 875.0 - SIDEBAR_H), "kept above the bottom");
-        assert_eq!(docked_pos(area, 364.0, Some(-50.0)), (1076.0, 25.0), "kept below the menu bar");
-        assert_eq!(docked_pos(area, 364.0, None).1, 25.0 + (875.0 - SIDEBAR_H) / 2.0, "centred by default");
-        // Second screen to the right: docks to that screen's right edge.
-        assert_eq!(docked_pos((1440.0, 0.0, 1920.0, 1080.0), 278.0, Some(100.0)), (3082.0, 100.0));
+        let r = DockEdge::Right;
+        assert_eq!(docked_pos(area, 364.0, Some(300.0), r), (1076.0, 300.0));
+        assert_eq!(docked_pos(area, 364.0, Some(800.0), r), (1076.0, 25.0 + 875.0 - SIDEBAR_H), "kept above the bottom");
+        assert_eq!(docked_pos(area, 364.0, Some(-50.0), r), (1076.0, 25.0), "kept below the menu bar");
+        assert_eq!(docked_pos(area, 364.0, None, r).1, 25.0 + (875.0 - SIDEBAR_H) / 2.0, "centred by default");
+        assert_eq!(docked_pos(area, 364.0, Some(300.0), DockEdge::Left), (0.0, 300.0));
+        // Second screen to the right: docks to that screen's edges.
+        assert_eq!(docked_pos((1440.0, 0.0, 1920.0, 1080.0), 278.0, Some(100.0), r), (3082.0, 100.0));
+        assert_eq!(docked_pos((1440.0, 0.0, 1920.0, 1080.0), 278.0, Some(100.0), DockEdge::Left), (1440.0, 100.0));
+    }
+
+    #[test]
+    fn drop_side_picks_the_edge() {
+        let area = (0.0, 25.0, 1920.0, 1055.0);
+        assert_eq!(edge_for_drop(area, 100.0, 278.0), DockEdge::Left);
+        assert_eq!(edge_for_drop(area, 820.0, 278.0), DockEdge::Left, "centre at 959 < 960");
+        assert_eq!(edge_for_drop(area, 822.0, 278.0), DockEdge::Right);
+        assert_eq!(edge_for_drop((1920.0, 0.0, 1728.0, 1117.0), 2000.0, 278.0), DockEdge::Left, "left half of a second screen");
+    }
+
+    #[test]
+    fn glide_eases_out() {
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert!(ease_out(0.5) > 0.8, "most of the distance early");
+        assert_eq!(ease_out(2.0), 1.0, "clamped");
     }
 
     fn input(cx: f64, cy: f64) -> EdgeInput {
-        EdgeInput { cursor: (cx, cy), win: (1556.0, 300.0, 364.0, SIDEBAR_H), edge_x: 1920.0, screen_right: 1920.0 }
+        EdgeInput { cursor: (cx, cy), win: (1556.0, 300.0, 364.0, SIDEBAR_H), work_left: 0.0, work_right: 1920.0, screen_left: 0.0, screen_right: 1920.0 }
     }
 
     #[test]
     fn reveal_needs_the_right_edge_level_with_the_sidebar() {
-        assert!(at_reveal_edge(&input(1919.0, 400.0)));
-        assert!(at_reveal_edge(&input(1917.5, 300.0 - 30.0)), "small vertical slack");
-        assert!(!at_reveal_edge(&input(1900.0, 400.0)), "not at the edge");
-        assert!(!at_reveal_edge(&input(1919.0, 900.0)), "edge, but far below the sidebar");
-        assert!(!at_reveal_edge(&input(1950.0, 400.0)), "on the next screen to the right");
+        let r = DockEdge::Right;
+        assert!(at_reveal_edge(&input(1919.0, 400.0), r));
+        assert!(at_reveal_edge(&input(1917.5, 300.0 - 30.0), r), "small vertical slack");
+        assert!(!at_reveal_edge(&input(1900.0, 400.0), r), "not at the edge");
+        assert!(!at_reveal_edge(&input(1919.0, 900.0), r), "edge, but far below the sidebar");
+        assert!(!at_reveal_edge(&input(1950.0, 400.0), r), "on the next screen to the right");
+        assert!(!at_reveal_edge(&input(1919.0, 400.0), DockEdge::Left), "wrong edge for a left dock");
+        assert!(at_reveal_edge(&input(0.5, 400.0), DockEdge::Left));
+        assert!(!at_reveal_edge(&input(-30.0, 400.0), DockEdge::Left), "on a screen to the left");
         // Dock on the right: the screen edge is past the work area; pushing against it still reveals.
-        let docked = EdgeInput { cursor: (1999.0, 400.0), win: (1500.0, 300.0, 364.0, SIDEBAR_H), edge_x: 1864.0, screen_right: 2000.0 };
-        assert!(at_reveal_edge(&docked));
+        let docked = EdgeInput { cursor: (1999.0, 400.0), win: (1500.0, 300.0, 364.0, SIDEBAR_H), work_left: 0.0, work_right: 1864.0, screen_left: 0.0, screen_right: 2000.0 };
+        assert!(at_reveal_edge(&docked, r));
     }
 
     #[test]

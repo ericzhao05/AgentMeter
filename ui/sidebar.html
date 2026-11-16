@@ -9,12 +9,13 @@
 <body>
 <main class="panel" id="panel">
   <header class="bar">
+    <span class="notice" id="notice" hidden></span>
     <span class="title">AgentMeter</span>
     <span class="demo" id="demo" hidden>demo</span>
     <button type="button" id="settings" title="Settings" aria-label="Settings">⚙︎</button>
   </header>
   <section class="tubes" id="tubes"></section>
-  <p class="empty" id="empty" hidden>No agents selected —<br><button type="button" class="link" id="empty-settings">open Settings</button></p>
+  <p class="empty" id="empty" hidden><span id="empty-text">No agents selected —</span><br><button type="button" class="link" id="empty-settings">open Settings</button></p>
 </main>
 <script src="tube.js"></script>
 <script src="sidebar.js"></script>

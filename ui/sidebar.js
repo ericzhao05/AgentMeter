@@ -20,15 +20,19 @@ const MAX_TUBES = 8;
 
 let settings = { tubeCount: 4, agents: [], demoMode: false, dockEdge: 'right' };
 let usage = [];
+let usageKnown = false;      // until the first usage snapshot arrives, nothing counts as "unreadable"
 let settingsKnown = false;   // don't render (or resize) until the real settings arrive
 const cols = new Map();         // agent id → { el, tube, last, refillTimer }
 const $ = id => document.getElementById(id);
 
-/* Every enabled agent gets a tube, in settings order (capped at MAX_TUBES; tubeCount is legacy and ignored).
-   First-run defaults are chosen by the backend; in demo mode the same ids are matched to mock data
-   (an id without a mock entry shows as unknown). */
-function chosenIds() {
-  return settings.agents.slice(0, MAX_TUBES);
+/* Enabled agents in settings order (tubeCount is legacy and ignored). Only agents whose usage can be
+   read get a tube (max MAX_TUBES); the rest are listed in the "Couldn't read usage" notice. */
+const readable = a => !!a && a.installed && typeof a.percentLeft === 'number';
+function partition() {
+  const byId = id => usage.find(a => a.id === id);
+  const shown = [], unreadable = [];
+  for (const id of settings.agents) (readable(byId(id)) ? shown : unreadable).push(id);
+  return { ids: shown.slice(0, MAX_TUBES), unreadable: usageKnown ? unreadable : [] };
 }
 
 /* Measured in WKWebView (2x display): the blurred glow layers are the main GPU cost and are only skipped
@@ -38,8 +42,7 @@ function glowFor(n) { return n <= 2 ? 1 : n <= 4 ? .8 : 0; }
 function makeCol(id) {
   const el = document.createElement('div');
   el.className = 'col';
-  el.innerHTML = '<div class="qmark" aria-hidden="true">?</div>'
-    + '<div class="label"><span class="name"></span><span class="pct"></span><span class="reset"></span></div>';
+  el.innerHTML = '<div class="label"><span class="name"></span><span class="pct"></span><span class="reset"></span></div>';
   const tube = createTube({ width: 70, height: 280, liquidColor: colorFor(id), fillLevel: 0, state: 'idle' });
   el.prepend(tube);
   return { el, tube, last: null, refillTimer: 0 };
@@ -100,9 +103,26 @@ function updateCol(id, c, a, glow) {
   c.el.title = tip.join('\n');
 }
 
+/* "Couldn't read usage: Gemini, Cursor" — in the header when tubes are shown, as the whole content
+   when none are; each agent's reason in the tooltip. */
+function renderNotice(unreadable, noTubes) {
+  const names = unreadable.map(id => usage.find(a => a.id === id)?.name ?? id);
+  const tip = unreadable.map(id => {
+    const a = usage.find(x => x.id === id);
+    const why = !a ? 'not detected' : !a.installed ? 'not installed' : (a.note || 'usage unavailable');
+    return `${a?.name ?? id}: ${why}`;
+  }).join('\n');
+  const text = names.length ? `Couldn't read usage: ${names.join(', ')}` : '';
+  const notice = $('notice');
+  notice.hidden = !text || noTubes;
+  notice.textContent = text;
+  notice.title = tip;
+  return { text, tip };
+}
+
 function render() {
   if (!settingsKnown) return;
-  const ids = chosenIds();
+  const { ids, unreadable } = partition();
   const box = $('tubes'), glow = glowFor(ids.length);
   for (const [id, c] of cols) if (!ids.includes(id)) { clearTimeout(c.refillTimer); c.tube.destroy(); c.el.remove(); cols.delete(id); }
   ids.forEach((id, i) => {
@@ -112,7 +132,14 @@ function render() {
     updateCol(id, c, usage.find(a => a.id === id), glow);
   });
   window.tubeLoop.maxFps = ids.some(id => usage.find(a => a.id === id)?.active) ? FPS_ACTIVE : FPS_IDLE;
-  $('empty').hidden = ids.length > 0;
+  const n = renderNotice(unreadable, ids.length === 0);
+  // Nothing to draw: either nothing is enabled, or nothing enabled is readable (then just the notice).
+  const empty = $('empty');
+  const allUnreadable = settings.agents.length > 0 && n.text;
+  empty.hidden = ids.length > 0 || (settings.agents.length > 0 && !n.text);
+  $('empty-text').textContent = allUnreadable ? n.text : 'No agents selected —';
+  $('empty-settings').hidden = !!allUnreadable;
+  empty.title = allUnreadable ? n.tip : '';
   $('demo').hidden = !settings.demoMode;
   invoke('resize_sidebar', { tubes: Math.max(1, ids.length) }).catch(console.error);
 }
@@ -134,8 +161,25 @@ $('panel').addEventListener('mousedown', e => {
    cursor is over it (hover: light background + gear). While slid out, the tube animation is paused. */
 const SLIDE_MS = 220;
 let pauseTimer = 0;
-function applySidebarState({ shown, hover }) {
+/* Debug builds log each slide's frame timing (rAF deltas over the slide), to check it stays smooth. */
+let lastShown = null;
+function measureSlide(kind) {
+  const times = [];
+  const t0 = performance.now();
+  const tick = t => { times.push(t); if (t - t0 < SLIDE_MS + 80) requestAnimationFrame(tick); else report(); };
+  const report = () => {
+    const gaps = times.slice(1).map((t, i) => t - times[i]);
+    const max = Math.max(...gaps), slow = gaps.filter(g => g > 20).length;
+    invoke('dev_log', { msg: `slide ${kind}: ${gaps.length} frames, max gap ${max.toFixed(1)}ms, >20ms: ${slow}` }).catch(() => {});
+  };
+  requestAnimationFrame(tick);
+}
+
+function applySidebarState({ shown, hover, edge }) {
   const panel = $('panel');
+  panel.classList.toggle('left', edge === 'left');
+  if (lastShown !== null && lastShown !== shown) measureSlide(shown ? 'in' : 'out');
+  lastShown = shown;
   panel.classList.toggle('shown', shown);
   panel.classList.toggle('hover', shown && hover);
   clearTimeout(pauseTimer);
@@ -146,13 +190,14 @@ function applySidebarState({ shown, hover }) {
 // Listen first, then fetch the initial snapshots. A snapshot is applied only if no event for that
 // stream arrived after its request started (otherwise the event is newer and wins).
 let settingsRev = 0, usageRev = 0, visRev = 0;
+const markUsage = u => { usage = u; usageKnown = true; };
 (async () => {
   await listen('sidebar-state', e => { visRev++; applySidebarState(e.payload); });
   const vRev = visRev;
   invoke('get_sidebar_state').then(v => { if (visRev === vRev) applySidebarState(v); }).catch(console.error);
-  await listen('usage-updated', e => { usageRev++; usage = e.payload; render(); });
+  await listen('usage-updated', e => { usageRev++; markUsage(e.payload); render(); });
   await listen('settings-changed', e => { settingsRev++; settingsKnown = true; settings = e.payload; render(); });
   const sRev = settingsRev, uRev = usageRev;
   invoke('get_settings').then(s => { if (settingsRev === sRev) { settingsKnown = true; settings = s; render(); } }).catch(console.error);
-  invoke('get_usage').then(u => { if (usageRev === uRev) { usage = u; render(); } }).catch(console.error);
+  invoke('get_usage').then(u => { if (usageRev === uRev && u.length) { markUsage(u); render(); } }).catch(console.error);
 })();
