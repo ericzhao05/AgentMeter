@@ -34,6 +34,15 @@ struct SettingsStore {
     needs_default_agents: bool,
     /// An invalid settings file couldn't be preserved: refuse writes until it can be (or Reset).
     blocked: Option<String>,
+    /// The file's own (legacy) demoMode. In memory demo_mode mirrors AGENTMETER_DEMO; on disk we
+    /// keep whatever the file had, so a dev demo run never rewrites it.
+    file_demo_mode: bool,
+}
+
+impl SettingsStore {
+    fn write(&self, app: &AppHandle, s: &Settings) -> Result<(), String> {
+        settings::save(app, &Settings { demo_mode: self.file_demo_mode, ..s.clone() })
+    }
 }
 
 /// Latest usage snapshot (published under its lock so emits stay in order).
@@ -104,7 +113,7 @@ fn demo_from_env() -> bool {
 #[tauri::command]
 async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     let state = app.state::<Arc<AppState>>().inner().clone();
-    // demoMode in the file is legacy: the env var decides, so keep it pinned to that.
+    // demoMode is legacy: in memory it mirrors the env var (the file keeps its own value).
     let settings = Settings { demo_mode: state.demo, ..settings.normalized() };
     let (a, st, s) = (app.clone(), state.clone(), settings.clone());
     let old = tauri::async_runtime::spawn_blocking(move || persist(&a, &st, s)).await.map_err(|e| e.to_string())??;
@@ -133,7 +142,7 @@ fn persist(app: &AppHandle, state: &AppState, settings: Settings) -> Result<Sett
         }
     }
     let old = store.settings.clone();
-    settings::save(app, &settings)?;
+    store.write(app, &settings)?;
     store.settings = settings.clone();
     store.needs_default_agents = false;
     app.emit("settings-changed", &settings).map_err(|e| e.to_string())?;
@@ -148,7 +157,8 @@ fn reset_settings(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = state.store.lock().unwrap();
         let fresh = Settings { demo_mode: state.demo, ..Settings::default() };
-        match settings::save(&app, &fresh) {
+        store.file_demo_mode = false;
+        match store.write(&app, &fresh) {
             Ok(()) => {
                 store.blocked = None;
                 store.needs_default_agents = true;
@@ -438,7 +448,7 @@ fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) 
                 store.settings.agents = data.iter().filter(|a| a.installed).map(|a| a.id.clone()).collect();
                 // While blocked, show the defaults but never write over the unpreserved file.
                 if store.blocked.is_none() {
-                    if let Err(e) = settings::save(&app, &store.settings) {
+                    if let Err(e) = store.write(&app, &store.settings) {
                         eprintln!("[agentmeter] could not save default agents: {e}");
                     }
                 }
@@ -492,7 +502,8 @@ pub fn run() {
             let handle = app.handle().clone();
             let demo = demo_from_env();
             let mut loaded = settings::load(&handle);
-            loaded.settings.demo_mode = demo; // legacy field: reflects the env var, not the file
+            let file_demo_mode = loaded.settings.demo_mode;
+            loaded.settings.demo_mode = demo; // legacy field: in memory it reflects the env var
             let (tx, rx) = mpsc::channel();
             let state = Arc::new(AppState {
                 demo,
@@ -500,6 +511,7 @@ pub fn run() {
                     settings: loaded.settings,
                     needs_default_agents: loaded.needs_default_agents,
                     blocked: loaded.blocked.clone(),
+                    file_demo_mode,
                 }),
                 usage: Mutex::new(UsageCache { data: Vec::new() }),
                 wake_poller: Mutex::new(tx),
