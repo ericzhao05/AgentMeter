@@ -100,7 +100,7 @@ mod tests {
     use std::fs;
 
     fn ctx(home: &Path) -> Ctx {
-        Ctx { home: home.to_path_buf(), now: Utc::now(), live: false }
+        Ctx { home: home.to_path_buf(), now: Utc::now(), live: false, cache_dir: None }
     }
 
     #[test]

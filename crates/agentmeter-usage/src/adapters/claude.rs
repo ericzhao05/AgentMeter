@@ -13,16 +13,17 @@
 //!    few days (a data-derived proxy for the limit; Anthropic does not publish
 //!    a token figure).
 //!
-//! Readings are cached for 60 s.
+//! Live access is rate-limit aware and persisted; see the adapter section below.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use chrono::{DateTime, Duration, DurationRound, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Adapter;
@@ -34,7 +35,6 @@ pub struct ClaudeCode;
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// Upper bound for the Keychain lookup (it can block waiting for user approval).
 const KEYCHAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
@@ -85,11 +85,15 @@ fn token_from_credentials(json: &str, now: DateTime<Utc>) -> Result<Token, Strin
 pub struct LiveError {
     pub msg: String,
     pub hard: bool,
+    /// HTTP status, if the API answered.
+    pub status: Option<u16>,
+    /// Raw `Retry-After` header value, if any.
+    pub retry_after: Option<String>,
 }
 
 impl LiveError {
     fn soft(msg: impl Into<String>) -> Self {
-        LiveError { msg: msg.into(), hard: false }
+        LiveError { msg: msg.into(), hard: false, status: None, retry_after: None }
     }
 }
 
@@ -125,6 +129,8 @@ fn read_credentials_json(home: &Path) -> Result<String, LiveError> {
                         KEYCHAIN_TIMEOUT.as_secs()
                     ),
                     hard: true,
+                    status: None,
+                    retry_after: None,
                 });
             }
             Err(_) => {} // item missing / access denied: try the file below
@@ -184,7 +190,19 @@ fn fetch_live(home: &Path, now: DateTime<Utc>) -> Result<Reading, LiveError> {
             Ok(parse_oauth_usage(&body)?)
         }
         // Only the status code is reported: never echo headers/body.
-        Err(ureq::Error::Status(code, _)) => Err(format!("usage API returned HTTP {code}").into()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let msg = if code == 429 {
+                "usage API rate-limited (HTTP 429)".to_string()
+            } else {
+                format!("usage API returned HTTP {code}")
+            };
+            Err(LiveError {
+                msg,
+                hard: false,
+                status: Some(code),
+                retry_after: resp.header("retry-after").map(str::to_string),
+            })
+        }
         Err(ureq::Error::Transport(t)) => Err(format!("usage API unreachable ({})", t.kind()).into()),
     }
 }
@@ -346,19 +364,240 @@ pub fn calibrate(used_tokens: u64, used_percent: f64) -> Option<u64> {
 }
 
 // ------------------------------------------------------------------- adapter
+//
+// The live endpoint is shared with Claude Code itself and rate-limits
+// aggressively, so access goes through a small persisted state machine:
+// * a successful reading is reused for 5 min (60 s shortly after a window reset);
+// * 429/5xx (and any other failure) back off, honouring `Retry-After`, else
+//   exponential 60 s -> 2 m -> 4 m ... capped at 15 min, with jitter;
+// * the API is never called during backoff, and only one fetch runs at a time;
+// * the last good reading is served (exact=false, with its age) while the API
+//   is unavailable;
+// * state is persisted to `<cache_dir>/claude-usage.json` (never the token) so
+//   app restarts neither re-hit the API nor lose the reading.
 
-struct CacheEntry {
-    /// Sequence number of the fetch that produced this entry (higher = started later).
-    seq: u64,
-    at: Instant,
-    home: PathBuf,
-    reading: Reading,
+const SUCCESS_TTL_SECS: i64 = 300;
+const POST_RESET_TTL_SECS: i64 = 60;
+/// How long after a window reset the short TTL applies.
+const POST_RESET_PERIOD_SECS: i64 = 600;
+const BACKOFF_BASE_SECS: i64 = 60;
+const BACKOFF_CAP_SECS: i64 = 900;
+const RETRY_AFTER_MAX_SECS: i64 = 3600;
+/// A last-good reading without a reset time is ignored after one full window.
+const LAST_GOOD_MAX_AGE_SECS: i64 = BLOCK_HOURS * 3600;
+const ESTIMATE_TTL: StdDuration = StdDuration::from_secs(60);
+pub const STATE_FILE: &str = "claude-usage.json";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GoodReading {
+    pub percent_left: f64,
+    pub resets_at: Option<DateTime<Utc>>,
+    pub fetched_at: DateTime<Utc>,
+    pub note: String,
 }
 
-static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
-static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Token budget learned from the last successful exact reading (process-local).
-static CALIBRATED_LIMIT: Mutex<Option<u64>> = Mutex::new(None);
+/// Persisted live-source state. Contains no credentials.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct LiveState {
+    pub last_good: Option<GoodReading>,
+    pub backoff_until: Option<DateTime<Utc>>,
+    pub failures: u32,
+    pub last_error: Option<String>,
+    pub last_error_hard: bool,
+    pub reset_seen_at: Option<DateTime<Utc>>,
+    pub calibrated_limit: Option<u64>,
+}
+
+/// Parse a `Retry-After` value: delta-seconds or an HTTP-date.
+pub fn retry_after_secs(v: &str, now: DateTime<Utc>) -> Option<i64> {
+    let v = v.trim();
+    if let Ok(n) = v.parse::<i64>() {
+        return Some(n.max(0));
+    }
+    DateTime::parse_from_rfc2822(v).ok().map(|d| (d.with_timezone(&Utc) - now).num_seconds().max(0))
+}
+
+/// Exponential backoff for the n-th consecutive failure (n >= 1), with up to
+/// +20% jitter (`jitter01` in 0..=1), capped at 15 min.
+pub fn backoff_secs(failures: u32, jitter01: f64) -> i64 {
+    let exp = BACKOFF_BASE_SECS.saturating_mul(1i64 << failures.saturating_sub(1).min(16));
+    let jitter = (exp as f64 * 0.2 * jitter01.clamp(0.0, 1.0)) as i64;
+    exp.saturating_add(jitter).min(BACKOFF_CAP_SECS)
+}
+
+fn note_reset(st: &mut LiveState, now: DateTime<Utc>) {
+    if let Some(r) = st.last_good.as_ref().and_then(|g| g.resets_at).filter(|r| *r <= now) {
+        if st.reset_seen_at.map_or(true, |seen| seen < r) {
+            st.reset_seen_at = Some(r);
+        }
+    }
+}
+
+/// Whether the live API may be called now.
+pub fn should_fetch(st: &LiveState, now: DateTime<Utc>) -> bool {
+    if st.backoff_until.is_some_and(|b| now < b) {
+        return false;
+    }
+    let Some(g) = &st.last_good else { return true };
+    if g.resets_at.is_some_and(|r| r <= now) {
+        return true; // window reset since the reading: refresh promptly
+    }
+    let just_reset = st.reset_seen_at.is_some_and(|r| (now - r).num_seconds() < POST_RESET_PERIOD_SECS);
+    let ttl = if just_reset { POST_RESET_TTL_SECS } else { SUCCESS_TTL_SECS };
+    (now - g.fetched_at).num_seconds() >= ttl || st.last_error.is_some()
+}
+
+fn record_success(st: &mut LiveState, r: &Reading, now: DateTime<Utc>) {
+    if let Some(p) = r.percent_left {
+        st.last_good = Some(GoodReading { percent_left: p, resets_at: r.resets_at, fetched_at: now, note: r.note.clone() });
+    }
+    st.failures = 0;
+    st.backoff_until = None;
+    st.last_error = None;
+    st.last_error_hard = false;
+}
+
+fn record_failure(st: &mut LiveState, e: &LiveError, now: DateTime<Utc>, jitter01: f64) {
+    st.failures = st.failures.saturating_add(1);
+    let wait = e
+        .retry_after
+        .as_deref()
+        .and_then(|v| retry_after_secs(v, now))
+        .map(|s| s.clamp(1, RETRY_AFTER_MAX_SECS))
+        .unwrap_or_else(|| backoff_secs(st.failures, jitter01));
+    st.backoff_until = Some(now + Duration::seconds(wait));
+    st.last_error = Some(e.msg.clone());
+    st.last_error_hard = e.hard;
+}
+
+pub fn human_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", (s + 30) / 60)
+    } else {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+fn retry_hint(st: &LiveState, now: DateTime<Utc>) -> String {
+    match st.backoff_until {
+        Some(b) if b > now => format!(", retrying in {}", human_duration((b - now).num_seconds())),
+        _ => String::new(),
+    }
+}
+
+/// Turn state into a reading. `est` lazily produces the log-based estimate.
+fn render(st: &LiveState, now: DateTime<Utc>, est: &mut dyn FnMut(Option<u64>) -> Reading) -> Reading {
+    let good = st
+        .last_good
+        .as_ref()
+        .filter(|g| g.resets_at.is_some() || (now - g.fetched_at).num_seconds() < LAST_GOOD_MAX_AGE_SECS);
+    if let Some(g) = good {
+        let reset_passed = g.resets_at.is_some_and(|r| r <= now);
+        if reset_passed {
+            // Window reset since the last exact reading: prefer local evidence,
+            // else show full (apply() marks it exact=false).
+            let r = est(st.calibrated_limit);
+            if r.percent_left.is_some() && r.resets_at.is_some() {
+                return r;
+            }
+        }
+        let age = human_duration((now - g.fetched_at).num_seconds());
+        return match &st.last_error {
+            None => Reading { percent_left: Some(g.percent_left), resets_at: g.resets_at, exact: true, note: g.note.clone() },
+            Some(err) => Reading {
+                percent_left: Some(g.percent_left),
+                resets_at: g.resets_at,
+                exact: false,
+                note: format!("Last exact reading {age} ago; {err}{}", retry_hint(st, now)),
+            },
+        };
+    }
+    if let (true, Some(err)) = (st.last_error_hard, &st.last_error) {
+        return Reading { percent_left: None, resets_at: None, exact: false, note: format!("error: {err}{}", retry_hint(st, now)) };
+    }
+    let mut r = est(st.calibrated_limit);
+    if let Some(err) = &st.last_error {
+        r.note = format!("{} [live: {err}{}]", r.note, retry_hint(st, now));
+    }
+    r
+}
+
+fn load_state(path: Option<&Path>) -> LiveState {
+    path.and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(path: Option<&Path>, st: &LiveState) {
+    let Some(p) = path else { return };
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(s) = serde_json::to_string_pretty(st) {
+        if fs::write(&tmp, s).is_ok() {
+            let _ = fs::rename(&tmp, p);
+        }
+    }
+}
+
+/// Process-wide live-source state (+ single-flight flag + estimate cache).
+pub(crate) struct Store {
+    state: Mutex<Option<(Option<PathBuf>, LiveState)>>,
+    in_flight: AtomicBool,
+    est: Mutex<Option<(Instant, PathBuf, Option<u64>, Reading)>>,
+}
+
+impl Store {
+    pub const fn new() -> Self {
+        Store { state: Mutex::new(None), in_flight: AtomicBool::new(false), est: Mutex::new(None) }
+    }
+
+    #[cfg(test)]
+    fn new_with(st: LiveState) -> Self {
+        let s = Store::new();
+        *s.state.lock().unwrap() = Some((None, st));
+        s
+    }
+
+    /// Current state, loading it from disk on first use (or when the path changes).
+    fn snapshot(&self, path: Option<&Path>) -> LiveState {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_ref().map_or(true, |(p, _)| p.as_deref() != path) {
+            *g = Some((path.map(Path::to_path_buf), load_state(path)));
+        }
+        g.as_ref().map(|(_, s)| s.clone()).unwrap_or_default()
+    }
+
+    fn update(&self, path: Option<&Path>, f: impl FnOnce(&mut LiveState)) -> LiveState {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_ref().map_or(true, |(p, _)| p.as_deref() != path) {
+            *g = Some((path.map(Path::to_path_buf), load_state(path)));
+        }
+        let st = &mut g.as_mut().expect("initialised above").1;
+        f(st);
+        save_state(path, st);
+        st.clone()
+    }
+
+    fn estimate(&self, ctx: &Ctx, limit: Option<u64>) -> Reading {
+        let mut g = self.est.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, home, l, r)) = g.as_ref() {
+            if at.elapsed() < ESTIMATE_TTL && *home == ctx.home && *l == limit {
+                return r.clone();
+            }
+        }
+        let r = estimate(&collect_entries(&ctx.path(".claude/projects"), ctx.now), ctx.now, limit);
+        *g = Some((Instant::now(), ctx.home.clone(), limit, r.clone()));
+        r
+    }
+}
+
+static STORE: Store = Store::new();
 
 type LiveFetch<'a> = &'a dyn Fn(&Ctx) -> Result<Reading, LiveError>;
 
@@ -366,74 +605,62 @@ fn real_fetch(ctx: &Ctx) -> Result<Reading, LiveError> {
     fetch_live(&ctx.home, ctx.now)
 }
 
-/// Compute a fresh reading. `live` is the exact source (None = file sources only).
-fn compute_with(ctx: &Ctx, live: Option<LiveFetch>) -> Reading {
-    let projects = ctx.path(".claude/projects");
-    let live_err = match live {
-        Some(fetch) => match fetch(ctx) {
-            Ok(r) => {
-                if let Some(left) = r.percent_left {
-                    let entries = collect_entries(&projects, ctx.now);
-                    let used = current_block(&blocks(&entries), ctx.now).map_or(0, |b| b.tokens);
-                    if let Some(limit) = calibrate(used, 100.0 - left) {
-                        *CALIBRATED_LIMIT.lock().unwrap_or_else(|p| p.into_inner()) = Some(limit);
-                    }
-                }
-                return r;
-            }
-            Err(e) if e.hard => {
-                return Reading { percent_left: None, resets_at: None, exact: false, note: format!("error: {}", e.msg) };
-            }
-            Err(e) => Some(e.msg),
-        },
-        None => None,
-    };
-    let limit = if live.is_some() { *CALIBRATED_LIMIT.lock().unwrap_or_else(|p| p.into_inner()) } else { None };
-    let mut r = estimate(&collect_entries(&projects, ctx.now), ctx.now, limit);
-    if let Some(e) = live_err {
-        r.note = format!("{} [live: {e}]", r.note);
-    }
-    r
+fn real_jitter() -> f64 {
+    let n = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    (n % 1000) as f64 / 1000.0
 }
 
-/// A cached reading is reusable only while fresh, for the same home, and while
-/// its window has not reset (post-reset usage has not been observed).
-fn cache_hit(entry: &CacheEntry, ctx: &Ctx, ttl: StdDuration) -> Option<Reading> {
-    let fresh = entry.at.elapsed() < ttl && entry.home == ctx.home;
-    let reset_passed = entry.reading.resets_at.is_some_and(|r| r <= ctx.now);
-    (fresh && !reset_passed).then(|| entry.reading.clone())
+/// Clears the single-flight flag even if the fetch panics.
+struct InFlight<'a>(&'a AtomicBool);
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 fn cached_reading(ctx: &Ctx) -> Reading {
     if !ctx.live {
-        return compute_with(ctx, None);
+        return estimate(&collect_entries(&ctx.path(".claude/projects"), ctx.now), ctx.now, None);
     }
-    cached_reading_with(&CACHE, &FETCH_SEQ, ctx, &real_fetch)
+    cached_reading_with(&STORE, ctx, &real_fetch, real_jitter())
 }
 
-/// Cache lookup + refresh. The lock is not held during the fetch. Each refresh
-/// takes a sequence number before fetching and publishes only if no fetch that
-/// started later has already published, so a slow older result (or error)
-/// never overwrites a newer reading.
-fn cached_reading_with(
-    cache: &Mutex<Option<CacheEntry>>,
-    seq: &AtomicU64,
-    ctx: &Ctx,
-    fetch: LiveFetch,
-) -> Reading {
+/// One poll: maybe fetch (outside backoff, single-flight, no lock held during
+/// the call), update + persist state, then render.
+fn cached_reading_with(store: &Store, ctx: &Ctx, fetch: LiveFetch, jitter01: f64) -> Reading {
+    let now = ctx.now;
+    let path = ctx.cache_dir.as_ref().map(|d| d.join(STATE_FILE));
+    let path = path.as_deref();
+    let mut st = store.snapshot(path);
+    note_reset(&mut st, now);
+    if should_fetch(&st, now)
+        && store.in_flight.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
     {
-        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = guard.as_ref().and_then(|e| cache_hit(e, ctx, CACHE_TTL)) {
-            return r;
-        }
-    } // lock released: the Keychain subprocess / HTTP call run without holding it
-    let my_seq = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let r = compute_with(ctx, Some(fetch));
-    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.as_ref().map_or(true, |e| my_seq > e.seq) {
-        *guard = Some(CacheEntry { seq: my_seq, at: Instant::now(), home: ctx.home.clone(), reading: r.clone() });
+        let _flight = InFlight(&store.in_flight);
+        let res = fetch(ctx);
+        // Calibrate the estimate's token budget from the exact reading.
+        let limit = match &res {
+            Ok(r) => r.percent_left.and_then(|left| {
+                let entries = collect_entries(&ctx.path(".claude/projects"), now);
+                let used = current_block(&blocks(&entries), now).map_or(0, |b| b.tokens);
+                calibrate(used, 100.0 - left)
+            }),
+            Err(_) => None,
+        };
+        st = store.update(path, |s| {
+            note_reset(s, now);
+            match &res {
+                Ok(r) => {
+                    record_success(s, r, now);
+                    if limit.is_some() {
+                        s.calibrated_limit = limit;
+                    }
+                }
+                Err(e) => record_failure(s, e, now, jitter01),
+            }
+        });
     }
-    r
+    render(&st, now, &mut |limit| store.estimate(ctx, limit))
 }
 
 /// Render a reading into the row, handling a window that has reset since the reading.
@@ -611,7 +838,7 @@ mod tests {
         fs::write(proj.join("sess.jsonl"), content).unwrap();
         fs::write(proj.join("sess/subagents/agent-1.jsonl"), assistant(&fmt(cur), "c2", 200, 0)).unwrap();
 
-        let ctx = Ctx { home: d.path().to_path_buf(), now, live: false };
+        let ctx = Ctx { home: d.path().to_path_buf(), now, live: false, cache_dir: None };
         let u = ClaudeCode.poll(&ctx).unwrap();
         assert!(u.installed && u.active && !u.exact);
         assert_eq!(u.percent_left, Some(50.0));
@@ -623,7 +850,7 @@ mod tests {
     fn adapter_installed_without_projects() {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join(".claude")).unwrap();
-        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: false };
+        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: false, cache_dir: None };
         let u = ClaudeCode.poll(&ctx).unwrap();
         assert!(u.installed && !u.active);
         assert_eq!(u.percent_left, None);
@@ -633,12 +860,39 @@ mod tests {
         Err(LiveError::soft("usage API returned HTTP 500"))
     }
 
-    #[test]
-    fn api_failure_and_missing_logs_is_unknown() {
+    fn never(_: &Ctx) -> Result<Reading, LiveError> {
+        panic!("live API must not be called here")
+    }
+
+    fn rate_limited(retry_after: Option<&str>) -> impl Fn(&Ctx) -> Result<Reading, LiveError> + '_ {
+        move |_| {
+            Err(LiveError {
+                msg: "usage API rate-limited (HTTP 429)".into(),
+                hard: false,
+                status: Some(429),
+                retry_after: retry_after.map(str::to_string),
+            })
+        }
+    }
+
+    fn ok_reading(left: f64, resets_at: Option<DateTime<Utc>>) -> impl Fn(&Ctx) -> Result<Reading, LiveError> {
+        move |_| Ok(Reading { percent_left: Some(left), resets_at, exact: true, note: "Live".into() })
+    }
+
+    fn live_ctx(home: &Path, now: DateTime<Utc>, cache: Option<&Path>) -> Ctx {
+        Ctx { home: home.to_path_buf(), now, live: true, cache_dir: cache.map(Path::to_path_buf) }
+    }
+
+    fn home_with_claude() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join(".claude")).unwrap();
-        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
-        let r = compute_with(&ctx, Some(&failing));
+        d
+    }
+
+    #[test]
+    fn api_failure_and_missing_logs_is_unknown() {
+        let d = home_with_claude();
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), Utc::now(), None), &failing, 0.0);
         assert_eq!(r.percent_left, None);
         assert!(!r.exact);
         assert!(r.note.contains("HTTP 500") && r.note.contains("unknown"));
@@ -651,8 +905,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("s.jsonl"), "{\"usage\": nope\n\u{0}\u{1}garbage\n{\"type\":\"assistant\"}").unwrap();
         fs::write(proj.join("bin.jsonl"), [0xffu8, 0xfe, 0x00, 0x9f]).unwrap();
-        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
-        let r = compute_with(&ctx, Some(&failing));
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), Utc::now(), None), &failing, 0.0);
         assert_eq!(r.percent_left, None);
     }
 
@@ -663,69 +916,188 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         let now = Utc::now();
         fs::write(proj.join("s.jsonl"), assistant(&rfc3339(now - Duration::hours(30)), "a", 10, 0)).unwrap();
-        let ctx = Ctx { home: d.path().to_path_buf(), now, live: true };
         let hung = |_: &Ctx| -> Result<Reading, LiveError> {
-            Err(LiveError { msg: "Keychain lookup did not finish within 3s".into(), hard: true })
+            Err(LiveError { msg: "Keychain lookup did not finish within 3s".into(), hard: true, status: None, retry_after: None })
         };
-        let r = compute_with(&ctx, Some(&hung));
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), now, None), &hung, 0.0);
         assert_eq!(r.percent_left, None);
         assert!(r.note.contains("Keychain"));
     }
 
     #[test]
-    fn slow_older_fetch_does_not_overwrite_newer_reading() {
-        use std::sync::mpsc;
-        let d = tempfile::tempdir().unwrap();
-        fs::create_dir_all(d.path().join(".claude")).unwrap();
-        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
-        let cache: Mutex<Option<CacheEntry>> = Mutex::new(None);
-        let seq = AtomicU64::new(0);
-        let good = Reading { percent_left: Some(42.0), resets_at: None, exact: true, note: "fresh".into() };
+    fn retry_after_parsing() {
+        let now = t("2026-11-15T12:00:00Z");
+        assert_eq!(retry_after_secs("120", now), Some(120));
+        assert_eq!(retry_after_secs(" 0 ", now), Some(0));
+        assert_eq!(retry_after_secs("Sun, 15 Nov 2026 12:05:00 GMT", now), Some(300));
+        assert_eq!(retry_after_secs("Sun, 15 Nov 2026 11:00:00 GMT", now), Some(0));
+        assert_eq!(retry_after_secs("soon", now), None);
+    }
 
+    #[test]
+    fn rate_limited_with_retry_after_seconds_blocks_calls() {
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        let r = cached_reading_with(&store, &live_ctx(d.path(), now, None), &rate_limited(Some("120")), 0.0);
+        assert!(r.note.contains("429") && r.note.contains("retrying in 2m"));
+        let st = store.snapshot(None);
+        assert_eq!(st.backoff_until, Some(now + Duration::seconds(120)));
+        // Within the backoff: no call.
+        cached_reading_with(&store, &live_ctx(d.path(), now + Duration::seconds(119), None), &never, 0.0);
+        // After it: allowed again.
+        let r = cached_reading_with(&store, &live_ctx(d.path(), now + Duration::seconds(121), None), &ok_reading(70.0, None), 0.0);
+        assert_eq!(r.percent_left, Some(70.0));
+        assert!(r.exact);
+        assert_eq!(store.snapshot(None).failures, 0);
+    }
+
+    #[test]
+    fn rate_limited_with_retry_after_date() {
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        cached_reading_with(&store, &live_ctx(d.path(), now, None), &rate_limited(Some("Sun, 15 Nov 2026 12:07:00 GMT")), 0.0);
+        assert_eq!(store.snapshot(None).backoff_until, Some(t("2026-11-15T12:07:00Z")));
+        cached_reading_with(&store, &live_ctx(d.path(), t("2026-11-15T12:06:59Z"), None), &never, 0.0);
+    }
+
+    #[test]
+    fn backoff_without_header_grows_and_caps() {
+        let secs: Vec<i64> = (1..=8).map(|n| backoff_secs(n, 0.0)).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 900, 900, 900, 900]);
+        assert!((1..=40).all(|n| backoff_secs(n, 1.0) <= BACKOFF_CAP_SECS));
+        assert_eq!(backoff_secs(1, 1.0), 72); // +20% jitter
+        assert_eq!(backoff_secs(u32::MAX, 0.5), BACKOFF_CAP_SECS);
+
+        // Through the state machine: each retry after the backoff expires waits longer.
+        let d = home_with_claude();
+        let store = Store::new();
+        let mut now = t("2026-11-15T12:00:00Z");
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            cached_reading_with(&store, &live_ctx(d.path(), now, None), &rate_limited(None), 0.0);
+            let until = store.snapshot(None).backoff_until.unwrap();
+            waits.push((until - now).num_seconds());
+            now = until;
+        }
+        assert_eq!(waits, [60, 120, 240, 480, 900, 900]);
+    }
+
+    #[test]
+    fn serves_last_good_during_backoff() {
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        let reset = Some(t("2026-11-15T15:00:00Z"));
+        let r = cached_reading_with(&store, &live_ctx(d.path(), now, None), &ok_reading(40.0, reset), 0.0);
+        assert!(r.exact && r.percent_left == Some(40.0));
+        // Within the 5-minute success TTL: served from state, no call.
+        let r = cached_reading_with(&store, &live_ctx(d.path(), now + Duration::seconds(299), None), &never, 0.0);
+        assert!(r.exact && r.percent_left == Some(40.0));
+        // TTL expired, API rate-limited: last good, flagged, with age and retry hint.
+        let later = now + Duration::minutes(6);
+        let r = cached_reading_with(&store, &live_ctx(d.path(), later, None), &rate_limited(Some("120")), 0.0);
+        assert_eq!(r.percent_left, Some(40.0));
+        assert_eq!(r.resets_at, reset);
+        assert!(!r.exact);
+        assert!(r.note.contains("Last exact reading 6m ago"), "{}", r.note);
+        assert!(r.note.contains("rate-limited") && r.note.contains("retrying in 2m"), "{}", r.note);
+    }
+
+    #[test]
+    fn persisted_state_loaded_on_startup() {
+        let d = home_with_claude();
+        let cache = tempfile::tempdir().unwrap();
+        let now = t("2026-11-15T12:00:00Z");
+        let reset = Some(t("2026-11-15T15:00:00Z"));
+        cached_reading_with(&Store::new(), &live_ctx(d.path(), now, Some(cache.path())), &ok_reading(33.0, reset), 0.0);
+        let saved = fs::read_to_string(cache.path().join(STATE_FILE)).unwrap();
+        assert!(saved.contains("33.0") && !saved.to_lowercase().contains("token\""));
+
+        // "Restart": fresh store, same cache dir -> reading served without calling the API.
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), now + Duration::minutes(1), Some(cache.path())), &never, 0.0);
+        assert_eq!(r.percent_left, Some(33.0));
+        assert!(r.exact);
+
+        // A persisted backoff is honoured after restart too.
+        let later = now + Duration::minutes(10);
+        cached_reading_with(&Store::new(), &live_ctx(d.path(), later, Some(cache.path())), &rate_limited(Some("600")), 0.0);
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), later + Duration::minutes(5), Some(cache.path())), &never, 0.0);
+        assert_eq!(r.percent_left, Some(33.0));
+        assert!(!r.exact);
+
+        // Corrupt state file -> defaults, no panic.
+        fs::write(cache.path().join(STATE_FILE), "{not json").unwrap();
+        let r = cached_reading_with(&Store::new(), &live_ctx(d.path(), later, Some(cache.path())), &ok_reading(80.0, reset), 0.0);
+        assert_eq!(r.percent_left, Some(80.0));
+    }
+
+    #[test]
+    fn expired_last_good_shows_full_or_estimate() {
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        cached_reading_with(&store, &live_ctx(d.path(), now, None), &ok_reading(5.0, Some(t("2026-11-15T13:00:00Z"))), 0.0);
+        // After the reset the API is rate-limited and there are no logs: full, not exact.
+        let after = t("2026-11-15T13:30:00Z");
+        let r = cached_reading_with(&store, &live_ctx(d.path(), after, None), &rate_limited(None), 0.0);
+        let mut u = AgentUsage::new("claude-code", "Claude Code");
+        apply(&mut u, &r, after);
+        assert_eq!(u.percent_left, Some(100.0));
+        assert!(!u.exact);
+
+        // With logs showing usage in the new window, the estimate is used instead.
+        let proj = d.path().join(".claude/projects/-p");
+        fs::create_dir_all(&proj).unwrap();
+        let lines = [
+            assistant(&rfc3339(after - Duration::hours(30)), "old", 1000, 0),
+            assistant(&rfc3339(after - Duration::minutes(10)), "new", 250, 0),
+        ];
+        fs::write(proj.join("s.jsonl"), lines.join("\n")).unwrap();
+        let r = cached_reading_with(&Store::new_with(store.snapshot(None)), &live_ctx(d.path(), after, None), &never, 0.0);
+        assert_eq!(r.percent_left, Some(75.0));
+        assert!(!r.exact && r.note.contains("Estimate"));
+    }
+
+    #[test]
+    fn single_flight_no_concurrent_calls() {
+        use std::sync::mpsc;
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        let ctx = live_ctx(d.path(), now, None);
         let (started_tx, started_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         std::thread::scope(|s| {
-            // Fetch A starts first, then stalls until released, then fails.
             let a = s.spawn(|| {
                 let slow = move |_: &Ctx| -> Result<Reading, LiveError> {
                     started_tx.send(()).unwrap();
                     go_rx.recv().unwrap();
-                    Err(LiveError::soft("usage API returned HTTP 500"))
+                    Ok(Reading { percent_left: Some(42.0), resets_at: None, exact: true, note: "Live".into() })
                 };
-                cached_reading_with(&cache, &seq, &ctx, &slow)
+                cached_reading_with(&store, &ctx, &slow, 0.0)
             });
             started_rx.recv().unwrap();
-            // Fetch B starts later and succeeds immediately.
-            let fast = |_: &Ctx| -> Result<Reading, LiveError> { Ok(good.clone()) };
-            assert_eq!(cached_reading_with(&cache, &seq, &ctx, &fast), good);
+            // While A's fetch is in flight, B must not call the API.
+            cached_reading_with(&store, &ctx, &never, 0.0);
             go_tx.send(()).unwrap();
-            let a_result = a.join().unwrap();
-            assert_eq!(a_result.percent_left, None); // A returns its own result...
+            assert_eq!(a.join().unwrap().percent_left, Some(42.0));
         });
-        // ...but does not replace B's newer reading in the cache.
-        let guard = cache.lock().unwrap();
-        assert_eq!(guard.as_ref().unwrap().reading, good);
-        drop(guard);
-        let never = |_: &Ctx| -> Result<Reading, LiveError> { panic!("should be served from cache") };
-        assert_eq!(cached_reading_with(&cache, &seq, &ctx, &never), good);
+        let r = cached_reading_with(&store, &ctx, &never, 0.0);
+        assert_eq!(r.percent_left, Some(42.0));
     }
 
     #[test]
-    fn cache_invalidated_once_window_resets() {
+    fn short_ttl_right_after_reset() {
         let now = t("2026-11-15T12:00:00Z");
-        let ctx = Ctx { home: PathBuf::from("/h"), now, live: true };
-        let mk = |reset: &str| CacheEntry {
-            seq: 1,
-            at: Instant::now(),
-            home: PathBuf::from("/h"),
-            reading: Reading { percent_left: Some(5.0), resets_at: Some(t(reset)), exact: true, note: "x".into() },
-        };
-        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &ctx, CACHE_TTL).is_some());
-        assert!(cache_hit(&mk("2026-11-15T11:59:00Z"), &ctx, CACHE_TTL).is_none());
-        // different home or expired TTL also miss
-        let other = Ctx { home: PathBuf::from("/other"), ..ctx.clone() };
-        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &other, CACHE_TTL).is_none());
-        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &ctx, StdDuration::ZERO).is_none());
+        let g = |fetched: DateTime<Utc>| GoodReading { percent_left: 90.0, resets_at: Some(t("2026-11-15T17:00:00Z")), fetched_at: fetched, note: String::new() };
+        let mut st = LiveState { last_good: Some(g(now - Duration::seconds(90))), ..Default::default() };
+        assert!(!should_fetch(&st, now)); // normal: 5 min TTL
+        st.reset_seen_at = Some(now - Duration::minutes(3));
+        assert!(should_fetch(&st, now)); // just after a reset: 60 s TTL
+        st.backoff_until = Some(now + Duration::seconds(1));
+        assert!(!should_fetch(&st, now)); // never during backoff
     }
 
     #[test]
