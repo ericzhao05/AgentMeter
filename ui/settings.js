@@ -17,8 +17,8 @@
  *   - Every change is saved immediately (no Save button), and a "Saved" pill confirms it. Saves are
  *     single-flight, latest wins; once the queue drains the page re-reads get_settings as the truth.
  *   - Event listeners are registered before the initial reads. The payload of the latest settings-changed
- *     is authoritative: shown at once when no local save is pending, used at the end of a save drain or
- *     read if one arrived meanwhile. Known limitation: a save already in flight overwrites a concurrent
+ *     is authoritative: shown at once when no local save is pending, and preferred over a get_settings
+ *     read it races. After saves drain, only events arriving after the final save resolved count. Known limitation: a save already in flight overwrites a concurrent
  *     external change (save_settings writes the whole object); the UI still converges to the stored state.
  *   - settings.agents holds ALL enabled agents in order, and can be longer than tubeCount.
  *     The sidebar should show the first tubeCount of them; the rest are marked "not shown" here.
@@ -162,6 +162,7 @@
   // the LATEST event is authoritative. eventSeq tells whether one arrived during a save or read.
   let latestEvent = null;
   let eventSeq = 0;
+  let editGen = 0;            // bumped on every local edit; lets a slow Retry detect it is stale
   let drag = null;
   let renderQueued = false;
 
@@ -216,6 +217,7 @@
 
   function commit(patch) {
     if (!ready) return;
+    editGen++;
     settings = normalize({ ...settings, ...patch });
     render();
     pendingSave = JSON.parse(JSON.stringify(settings));
@@ -223,13 +225,13 @@
   }
 
   // Single-flight save queue: at most one save in flight plus one pending snapshot (latest wins).
-  // When it drains (success or failure): if a settings-changed arrived since the drain started, its
-  // payload is the truth; otherwise one get_settings read is. If the user edited again meanwhile, that
+  // When it drains (success or failure), one get_settings read is the truth, or a settings-changed that
+  // arrives during that read, i.e. AFTER the final save resolved. Events that arrived while our save was
+  // in flight are ignored: that save may have overwritten them. If the user edited again meanwhile, that
   // edit is saved first. A failed read shows a retryable "Couldn't refresh settings" error, not "Saved".
   async function pump() {
     if (saving) return;
     saving = true;
-    const drainSeq = eventSeq;
     let failed = false, fresh = null, refreshFailed = false;
     while (pendingSave) {
       const snap = pendingSave;
@@ -238,11 +240,8 @@
       catch (err) { failed = true; console.error('save_settings failed', err); }
     }
     if (!pendingSave) {
-      if (eventSeq !== drainSeq) fresh = latestEvent;
-      else {
-        try { fresh = await readAuthoritative(); }
-        catch (err) { refreshFailed = true; console.error('get_settings after save failed', err); }
-      }
+      try { fresh = await readAuthoritative(); }
+      catch (err) { refreshFailed = true; console.error('get_settings after save failed', err); }
     }
     saving = false;
     if (pendingSave) { pump(); return; }
@@ -544,15 +543,18 @@
       .catch(err => console.error('get_usage failed', err));
     await loadSettings();
   }
-  // Retry after a failed refresh: one read; skipped if the user has edited since (their save reconciles).
+  // Retry after a failed refresh: one read. Its result (or error) is discarded if the user edited or a
+  // settings-changed arrived meanwhile; those already brought newer state.
   async function refreshSettings() {
     hideError();
+    const gen = editGen, seq = eventSeq;
+    const stale = () => editGen !== gen || eventSeq !== seq || saving || pendingSave;
     try {
       const fresh = await readAuthoritative();
-      if (!saving && !pendingSave) applySettings(fresh);
+      if (!stale()) applySettings(fresh);
     } catch (err) {
       console.error('get_settings refresh failed', err);
-      if (!saving && !pendingSave) showError('refresh');
+      if (!stale()) showError('refresh');
     }
   }
   $('load-retry').addEventListener('click', () => (ready ? refreshSettings() : loadSettings()));
