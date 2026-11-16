@@ -73,15 +73,23 @@ pub fn last_reading(contents: &str) -> Option<Reading> {
     contents.lines().rev().find_map(parse_line)
 }
 
-/// Find the newest reading across the newest session files.
+/// Find the newest reading across the most recently modified session files.
+///
+/// File mtime only selects candidates: a file can be touched by a non-quota
+/// event after a newer reading was written elsewhere, so the winner is the
+/// reading with the latest event timestamp. Readings without a timestamp rank
+/// below timestamped ones; ties fall back to file mtime order.
 pub fn newest_reading(sessions: &Path) -> Option<Reading> {
     let mut files = walk_files(sessions, 4, &is_jsonl);
     files.sort_by(|a, b| b.1.cmp(&a.1));
-    files
-        .iter()
-        .take(MAX_FILES)
-        .filter_map(|(p, _)| fs::read_to_string(p).ok())
-        .find_map(|c| last_reading(&c))
+    let mut best: Option<Reading> = None;
+    for (p, _) in files.iter().take(MAX_FILES) {
+        let Some(r) = fs::read_to_string(p).ok().and_then(|c| last_reading(&c)) else { continue };
+        if best.as_ref().map_or(true, |b| r.at > b.at) {
+            best = Some(r);
+        }
+    }
+    best
 }
 
 /// Turn a reading into the user-facing row fields.
@@ -92,10 +100,12 @@ pub fn apply(u: &mut AgentUsage, r: &Reading, now: DateTime<Utc>) {
     let mut notes = Vec::new();
     match p.resets_at {
         Some(reset) if reset <= now => {
+            // Usage since the reset has not been observed: assume full, flag as estimate.
             u.percent_left = Some(100.0);
             u.resets_at = None;
+            u.exact = false;
             notes.push(format!(
-                "Window reset at {} since the last reading; showing full",
+                "Window reset at {}; no newer reading, assuming full",
                 rfc3339(reset)
             ));
         }
@@ -227,7 +237,36 @@ mod tests {
         apply(&mut u, &r, now);
         assert_eq!(u.percent_left, Some(100.0));
         assert!(u.resets_at.is_none());
-        assert!(u.note.unwrap().contains("reset"));
+        assert!(!u.exact, "post-reset usage is unobserved, so not exact");
+        assert!(u.note.unwrap().contains("no newer reading"));
+    }
+
+    #[test]
+    fn newest_reading_by_event_time_not_mtime() {
+        use std::time::{Duration as StdDuration, SystemTime};
+        let d = tempfile::tempdir().unwrap();
+        let sessions = d.path().join("sessions");
+        let day = sessions.join("2026/11/15");
+        fs::create_dir_all(&day).unwrap();
+        // Older session: older quota reading, but touched most recently by a non-quota event.
+        let old = day.join("rollout-old.jsonl");
+        fs::write(
+            &old,
+            format!(
+                "{}\n{{\"timestamp\":\"2026-11-15T12:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\"}}}}\n",
+                line(10.0, 2_000_000_000, "2026-11-15T09:00:00Z")
+            ),
+        )
+        .unwrap();
+        // Newer session: newer quota reading, older mtime.
+        let new = day.join("rollout-new.jsonl");
+        fs::write(&new, line(55.0, 2_000_000_000, "2026-11-15T11:00:00Z")).unwrap();
+        let t0 = SystemTime::now();
+        fs::File::options().write(true).open(&new).unwrap().set_modified(t0 - StdDuration::from_secs(600)).unwrap();
+        fs::File::options().write(true).open(&old).unwrap().set_modified(t0).unwrap();
+
+        let r = newest_reading(&sessions).unwrap();
+        assert_eq!(r.primary.used_percent, 55.0);
     }
 
     #[test]

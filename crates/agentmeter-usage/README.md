@@ -31,8 +31,9 @@ not it is installed. Adapter errors become a `note` with `percent_left: None`.
 Panics inside an adapter are caught.
 
 `poll_all` blocks the calling thread. Most calls finish in well under 100 ms.
-The exception is a Claude Code cache miss (about once every 60 s), which makes
-an HTTP call with a 5 s timeout and may also scan logs. From Tauri, call it
+The exception is a Claude Code cache miss (about once every 60 s). That runs a
+Keychain lookup (3 s deadline) and an HTTP call (5 s timeout), and may also
+scan logs. From Tauri, call it
 from a background thread or `spawn_blocking`, not from the main thread.
 
 `mock_all(t)`: Claude Code drains from 100% to 10% over 90 s and then resets to
@@ -65,12 +66,15 @@ Each turn, Codex appends an `event_msg` with
 `resets_at` is epoch seconds. Older CLIs used `resets_in_seconds`, relative
 to the event timestamp, and both forms are supported.
 
-The adapter reads the last such event in the newest session files (up to the
-20 newest).
+The adapter takes the 20 most recently modified session files as candidates.
+From those, it picks the reading with the **latest event timestamp**. File
+mtime alone isn't trusted, because an old session touched by a non-quota event
+would otherwise win with stale numbers.
 
 - `percent_left = 100 - primary.used_percent`, and `exact = true`.
 - If `resets_at` is already in the past, the window has reset since the last
-  reading. It then reports 100% and says so in the note.
+  reading. It then reports 100% with **`exact = false`**, because usage since
+  the reset hasn't been observed, and the note says so.
 - The weekly window's remainder is shown in the note.
 
 Limitation: the value is only as fresh as the last Codex turn.
@@ -91,7 +95,14 @@ Limitation: the value is only as fresh as the last Codex turn.
      only HTTP status codes.
    - If the stored token has expired, the adapter does not refresh it. It
      falls back to the estimate, and the note asks you to open Claude Code.
-   - Results are cached for 60 s and use a 5 s HTTP timeout.
+   - The Keychain lookup runs as a subprocess with a 3 s deadline. If it hangs
+     (for example, waiting for access approval), it is killed and the row
+     reports unknown with an error note, so other agents are still polled.
+   - Results are cached for 60 s, and the HTTP call has a 5 s timeout. The
+     cache lock is never held across the Keychain or HTTP call.
+   - A cached reading whose `resets_at` has passed is discarded and fetched
+     again. If no fresh exact reading is available, a reset window reports
+     100% with `exact = false`.
 2. **Estimate fallback.** This runs when the API is unavailable (not logged in
    with a subscription, offline, HTTP error), and also in `poll_all_at`.
    - It rebuilds 5-hour session blocks from assistant `message.usage` records
@@ -105,6 +116,8 @@ Limitation: the value is only as fresh as the last Codex turn.
      - Otherwise, **peak proxy**: the busiest completed block in the history.
    - If the current block is busier than the peak, it returns unknown rather
      than a made-up 0%.
+   - If no usable records exist (logs missing, unreadable, or malformed), it
+     returns unknown rather than a full tube.
    - Always `exact = false`, with a note explaining what was compared.
 
    Limitations:

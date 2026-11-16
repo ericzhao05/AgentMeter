@@ -25,7 +25,7 @@ use chrono::{DateTime, Duration, DurationRound, Utc};
 use serde_json::Value;
 
 use super::Adapter;
-use crate::util::{clamp_pct, is_jsonl, is_recent, rfc3339, round1, walk_files};
+use crate::util::{clamp_pct, is_jsonl, is_recent, rfc3339, round1, run_with_deadline, walk_files};
 use crate::{AgentUsage, Ctx};
 
 pub struct ClaudeCode;
@@ -35,6 +35,8 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
 const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+/// Upper bound for the Keychain lookup (it can block waiting for user approval).
+const KEYCHAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const BLOCK_HOURS: i64 = 5;
 /// History scanned for the estimate (files older than this are skipped).
 const HISTORY_DAYS: i64 = 8;
@@ -76,25 +78,60 @@ fn token_from_credentials(json: &str, now: DateTime<Utc>) -> Result<Token, Strin
     Ok(Token(tok.to_string()))
 }
 
-fn read_credentials_json(home: &Path) -> Result<String, String> {
+/// Why the live source failed. `hard` errors are reported as-is (unknown)
+/// instead of falling back to the estimate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveError {
+    pub msg: String,
+    pub hard: bool,
+}
+
+impl LiveError {
+    fn soft(msg: impl Into<String>) -> Self {
+        LiveError { msg: msg.into(), hard: false }
+    }
+}
+
+impl From<String> for LiveError {
+    fn from(msg: String) -> Self {
+        LiveError::soft(msg)
+    }
+}
+
+impl From<&str> for LiveError {
+    fn from(msg: &str) -> Self {
+        LiveError::soft(msg)
+    }
+}
+
+fn read_credentials_json(home: &Path) -> Result<String, LiveError> {
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("/usr/bin/security")
-            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-            .stderr(std::process::Stdio::null())
-            .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                if let Ok(s) = String::from_utf8(o.stdout) {
+        let mut cmd = std::process::Command::new("/usr/bin/security");
+        cmd.args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"]);
+        match run_with_deadline(&mut cmd, KEYCHAIN_TIMEOUT) {
+            Ok(out) => {
+                if let Ok(s) = String::from_utf8(out) {
                     if !s.trim().is_empty() {
                         return Ok(s);
                     }
                 }
             }
+            Err(e) if e.contains("timed out") => {
+                return Err(LiveError {
+                    msg: format!(
+                        "Keychain lookup did not finish within {}s (waiting for access approval?)",
+                        KEYCHAIN_TIMEOUT.as_secs()
+                    ),
+                    hard: true,
+                });
+            }
+            Err(_) => {} // item missing / access denied: try the file below
         }
     }
-    fs::read_to_string(home.join(".claude/.credentials.json"))
-        .map_err(|_| "no Claude Code OAuth credentials found (not logged in with a Claude subscription?)".into())
+    fs::read_to_string(home.join(".claude/.credentials.json")).map_err(|_| {
+        LiveError::soft("no Claude Code OAuth credentials found (not logged in with a Claude subscription?)")
+    })
 }
 
 /// Parse the `/api/oauth/usage` response body.
@@ -127,7 +164,7 @@ pub fn parse_oauth_usage(body: &str) -> Result<Reading, String> {
     })
 }
 
-fn fetch_live(home: &Path, now: DateTime<Utc>) -> Result<Reading, String> {
+fn fetch_live(home: &Path, now: DateTime<Utc>) -> Result<Reading, LiveError> {
     let creds = read_credentials_json(home)?;
     let token = token_from_credentials(&creds, now)?;
     drop(creds);
@@ -143,11 +180,11 @@ fn fetch_live(home: &Path, now: DateTime<Utc>) -> Result<Reading, String> {
     match resp {
         Ok(r) => {
             let body = r.into_string().map_err(|_| "could not read usage response")?;
-            parse_oauth_usage(&body)
+            Ok(parse_oauth_usage(&body)?)
         }
         // Only the status code is reported: never echo headers/body.
-        Err(ureq::Error::Status(code, _)) => Err(format!("usage API returned HTTP {code}")),
-        Err(ureq::Error::Transport(t)) => Err(format!("usage API unreachable ({})", t.kind())),
+        Err(ureq::Error::Status(code, _)) => Err(format!("usage API returned HTTP {code}").into()),
+        Err(ureq::Error::Transport(t)) => Err(format!("usage API unreachable ({})", t.kind()).into()),
     }
 }
 
@@ -248,8 +285,16 @@ pub fn current_block(bl: &[Block], now: DateTime<Utc>) -> Option<Block> {
 /// (see [`calibrate`]); without it, the busiest completed block in the scanned
 /// history is used as a proxy for the limit.
 pub fn estimate(entries: &[Entry], now: DateTime<Utc>, calibrated_limit: Option<u64>) -> Reading {
-    let bl = blocks(entries);
     let base = "Estimate from local Claude Code logs (exact usage API unavailable)";
+    if entries.is_empty() {
+        return Reading {
+            percent_left: None,
+            resets_at: None,
+            exact: false,
+            note: format!("{base}: no usable usage records in ~/.claude/projects, so remaining usage is unknown"),
+        };
+    }
+    let bl = blocks(entries);
     let Some(cur) = current_block(&bl, now) else {
         return Reading {
             percent_left: Some(100.0),
@@ -301,14 +346,27 @@ pub fn calibrate(used_tokens: u64, used_percent: f64) -> Option<u64> {
 
 // ------------------------------------------------------------------- adapter
 
-static CACHE: Mutex<Option<(Instant, PathBuf, Reading)>> = Mutex::new(None);
+struct CacheEntry {
+    at: Instant,
+    home: PathBuf,
+    reading: Reading,
+}
+
+static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
 /// Token budget learned from the last successful exact reading (process-local).
 static CALIBRATED_LIMIT: Mutex<Option<u64>> = Mutex::new(None);
 
-fn compute(ctx: &Ctx) -> Reading {
+type LiveFetch<'a> = &'a dyn Fn(&Ctx) -> Result<Reading, LiveError>;
+
+fn real_fetch(ctx: &Ctx) -> Result<Reading, LiveError> {
+    fetch_live(&ctx.home, ctx.now)
+}
+
+/// Compute a fresh reading. `live` is the exact source (None = file sources only).
+fn compute_with(ctx: &Ctx, live: Option<LiveFetch>) -> Reading {
     let projects = ctx.path(".claude/projects");
-    let live_err = if ctx.live {
-        match fetch_live(&ctx.home, ctx.now) {
+    let live_err = match live {
+        Some(fetch) => match fetch(ctx) {
             Ok(r) => {
                 if let Some(left) = r.percent_left {
                     let entries = collect_entries(&projects, ctx.now);
@@ -319,12 +377,14 @@ fn compute(ctx: &Ctx) -> Reading {
                 }
                 return r;
             }
-            Err(e) => Some(e),
-        }
-    } else {
-        None
+            Err(e) if e.hard => {
+                return Reading { percent_left: None, resets_at: None, exact: false, note: format!("error: {}", e.msg) };
+            }
+            Err(e) => Some(e.msg),
+        },
+        None => None,
     };
-    let limit = if ctx.live { *CALIBRATED_LIMIT.lock().unwrap_or_else(|p| p.into_inner()) } else { None };
+    let limit = if live.is_some() { *CALIBRATED_LIMIT.lock().unwrap_or_else(|p| p.into_inner()) } else { None };
     let mut r = estimate(&collect_entries(&projects, ctx.now), ctx.now, limit);
     if let Some(e) = live_err {
         r.note = format!("{} [live: {e}]", r.note);
@@ -332,18 +392,27 @@ fn compute(ctx: &Ctx) -> Reading {
     r
 }
 
+/// A cached reading is reusable only while fresh, for the same home, and while
+/// its window has not reset (post-reset usage has not been observed).
+fn cache_hit(entry: &CacheEntry, ctx: &Ctx, ttl: StdDuration) -> Option<Reading> {
+    let fresh = entry.at.elapsed() < ttl && entry.home == ctx.home;
+    let reset_passed = entry.reading.resets_at.is_some_and(|r| r <= ctx.now);
+    (fresh && !reset_passed).then(|| entry.reading.clone())
+}
+
 fn cached_reading(ctx: &Ctx) -> Reading {
     if !ctx.live {
-        return compute(ctx);
+        return compute_with(ctx, None);
     }
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, home, r)) = guard.as_ref() {
-        if at.elapsed() < CACHE_TTL && *home == ctx.home {
-            return r.clone();
+    {
+        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = guard.as_ref().and_then(|e| cache_hit(e, ctx, CACHE_TTL)) {
+            return r;
         }
-    }
-    let r = compute(ctx);
-    *guard = Some((Instant::now(), ctx.home.clone(), r.clone()));
+    } // lock released: the Keychain subprocess / HTTP call run without holding it
+    let r = compute_with(ctx, Some(&real_fetch));
+    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(CacheEntry { at: Instant::now(), home: ctx.home.clone(), reading: r.clone() });
     r
 }
 
@@ -353,9 +422,15 @@ pub fn apply(u: &mut AgentUsage, r: &Reading, now: DateTime<Utc>) {
     u.exact = r.exact;
     match r.resets_at {
         Some(reset) if reset <= now => {
+            // Usage since the reset has not been observed: assume full, flag as estimate.
             u.percent_left = Some(100.0);
             u.resets_at = None;
-            u.note = Some(format!("{}; window reset at {}", r.note, rfc3339(reset)));
+            u.exact = false;
+            u.note = Some(format!(
+                "Window reset at {}; no newer reading, assuming full. Previous: {}",
+                rfc3339(reset),
+                r.note
+            ));
         }
         reset => {
             u.percent_left = r.percent_left;
@@ -486,8 +561,8 @@ mod tests {
         assert_eq!(estimate(&es, t("2026-11-15T16:00:00Z"), None).percent_left, Some(100.0));
         // only a current block, no history -> unknown
         assert_eq!(estimate(&es[3..], now, None).percent_left, None);
-        // nothing at all
-        assert_eq!(estimate(&[], now, None).percent_left, Some(100.0));
+        // nothing at all -> no evidence -> unknown
+        assert_eq!(estimate(&[], now, None).percent_left, None);
     }
 
     #[test]
@@ -531,7 +606,67 @@ mod tests {
         let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: false };
         let u = ClaudeCode.poll(&ctx).unwrap();
         assert!(u.installed && !u.active);
-        assert_eq!(u.percent_left, Some(100.0));
+        assert_eq!(u.percent_left, None);
+    }
+
+    fn failing(_: &Ctx) -> Result<Reading, LiveError> {
+        Err(LiveError::soft("usage API returned HTTP 500"))
+    }
+
+    #[test]
+    fn api_failure_and_missing_logs_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
+        let r = compute_with(&ctx, Some(&failing));
+        assert_eq!(r.percent_left, None);
+        assert!(!r.exact);
+        assert!(r.note.contains("HTTP 500") && r.note.contains("unknown"));
+    }
+
+    #[test]
+    fn api_failure_and_corrupt_logs_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join(".claude/projects/-p");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("s.jsonl"), "{\"usage\": nope\n\u{0}\u{1}garbage\n{\"type\":\"assistant\"}").unwrap();
+        fs::write(proj.join("bin.jsonl"), [0xffu8, 0xfe, 0x00, 0x9f]).unwrap();
+        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
+        let r = compute_with(&ctx, Some(&failing));
+        assert_eq!(r.percent_left, None);
+    }
+
+    #[test]
+    fn keychain_timeout_is_hard_error_without_estimate() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join(".claude/projects/-p");
+        fs::create_dir_all(&proj).unwrap();
+        let now = Utc::now();
+        fs::write(proj.join("s.jsonl"), assistant(&rfc3339(now - Duration::hours(30)), "a", 10, 0)).unwrap();
+        let ctx = Ctx { home: d.path().to_path_buf(), now, live: true };
+        let hung = |_: &Ctx| -> Result<Reading, LiveError> {
+            Err(LiveError { msg: "Keychain lookup did not finish within 3s".into(), hard: true })
+        };
+        let r = compute_with(&ctx, Some(&hung));
+        assert_eq!(r.percent_left, None);
+        assert!(r.note.contains("Keychain"));
+    }
+
+    #[test]
+    fn cache_invalidated_once_window_resets() {
+        let now = t("2026-11-15T12:00:00Z");
+        let ctx = Ctx { home: PathBuf::from("/h"), now, live: true };
+        let mk = |reset: &str| CacheEntry {
+            at: Instant::now(),
+            home: PathBuf::from("/h"),
+            reading: Reading { percent_left: Some(5.0), resets_at: Some(t(reset)), exact: true, note: "x".into() },
+        };
+        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &ctx, CACHE_TTL).is_some());
+        assert!(cache_hit(&mk("2026-11-15T11:59:00Z"), &ctx, CACHE_TTL).is_none());
+        // different home or expired TTL also miss
+        let other = Ctx { home: PathBuf::from("/other"), ..ctx.clone() };
+        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &other, CACHE_TTL).is_none());
+        assert!(cache_hit(&mk("2026-11-15T13:00:00Z"), &ctx, StdDuration::ZERO).is_none());
     }
 
     #[test]
@@ -542,5 +677,7 @@ mod tests {
         apply(&mut u, &r, now);
         assert_eq!(u.percent_left, Some(100.0));
         assert!(u.resets_at.is_none());
+        assert!(!u.exact, "post-reset usage is unobserved, so not exact");
+        assert!(u.note.unwrap().contains("no newer reading"));
     }
 }
