@@ -20,7 +20,7 @@ mod adapters;
 mod mock;
 mod util;
 
-pub use mock::mock_all;
+pub use mock::{mock_all, mock_at};
 
 /// Usage snapshot for one agent. Serialized camelCase for the Tauri frontend.
 #[derive(Serialize, Clone, Debug)]
