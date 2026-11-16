@@ -22,7 +22,8 @@ pub struct AgentUsage {
 }
 
 pub fn poll_all() -> Vec<AgentUsage>;          // real data; sync; never panics
-pub fn mock_all(t: f64) -> Vec<AgentUsage>;    // deterministic demo data
+pub fn mock_all(t: f64) -> Vec<AgentUsage>;    // demo data (percentages deterministic in t)
+pub fn mock_at(t: f64, now: DateTime<Utc>) -> Vec<AgentUsage>; // fully deterministic demo data
 pub fn poll_all_at(home: &Path) -> Vec<AgentUsage>; // file sources only, custom $HOME (no Keychain/network)
 ```
 
@@ -101,10 +102,13 @@ Limitation: the value is only as fresh as the last Codex turn.
      in a type whose `Debug` output is redacted, and error messages contain
      only HTTP status codes.
    - If the stored token has expired, the adapter does not refresh it. It
-     falls back to the estimate, and the note asks you to open Claude Code.
+     shows the last good reading (`exact = false`) if one is available, or
+     else the log estimate. The note asks you to open Claude Code.
    - The Keychain lookup runs as a subprocess with a 3 s deadline. If it hangs
-     (for example, waiting for access approval), it is killed and the row
-     reports unknown with an error note, so other agents are still polled.
+     (for example, waiting for access approval), it is killed, so other
+     agents are still polled. The row shows the last good reading
+     (`exact = false`) if one is available. Otherwise it is unknown, with an
+     error note.
    - The HTTP call has a 5 s timeout.
    - **Gentle on the endpoint.** Claude Code itself also calls this endpoint,
      and it rate-limits.
