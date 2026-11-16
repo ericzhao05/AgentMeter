@@ -1,0 +1,20 @@
+[package]
+name = "agentmeter-usage"
+version = "0.1.0"
+edition = "2021"
+description = "Per-agent usage-limit readers for AgentMeter (Codex, Claude Code, Gemini, Cursor, ...)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "agentmeter_usage"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
