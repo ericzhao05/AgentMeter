@@ -18,6 +18,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
@@ -347,12 +348,15 @@ pub fn calibrate(used_tokens: u64, used_percent: f64) -> Option<u64> {
 // ------------------------------------------------------------------- adapter
 
 struct CacheEntry {
+    /// Sequence number of the fetch that produced this entry (higher = started later).
+    seq: u64,
     at: Instant,
     home: PathBuf,
     reading: Reading,
 }
 
 static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
+static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Token budget learned from the last successful exact reading (process-local).
 static CALIBRATED_LIMIT: Mutex<Option<u64>> = Mutex::new(None);
 
@@ -404,15 +408,31 @@ fn cached_reading(ctx: &Ctx) -> Reading {
     if !ctx.live {
         return compute_with(ctx, None);
     }
+    cached_reading_with(&CACHE, &FETCH_SEQ, ctx, &real_fetch)
+}
+
+/// Cache lookup + refresh. The lock is not held during the fetch. Each refresh
+/// takes a sequence number before fetching and publishes only if no fetch that
+/// started later has already published, so a slow older result (or error)
+/// never overwrites a newer reading.
+fn cached_reading_with(
+    cache: &Mutex<Option<CacheEntry>>,
+    seq: &AtomicU64,
+    ctx: &Ctx,
+    fetch: LiveFetch,
+) -> Reading {
     {
-        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(r) = guard.as_ref().and_then(|e| cache_hit(e, ctx, CACHE_TTL)) {
             return r;
         }
     } // lock released: the Keychain subprocess / HTTP call run without holding it
-    let r = compute_with(ctx, Some(&real_fetch));
-    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(CacheEntry { at: Instant::now(), home: ctx.home.clone(), reading: r.clone() });
+    let my_seq = seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let r = compute_with(ctx, Some(fetch));
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.as_ref().map_or(true, |e| my_seq > e.seq) {
+        *guard = Some(CacheEntry { seq: my_seq, at: Instant::now(), home: ctx.home.clone(), reading: r.clone() });
+    }
     r
 }
 
@@ -653,10 +673,49 @@ mod tests {
     }
 
     #[test]
+    fn slow_older_fetch_does_not_overwrite_newer_reading() {
+        use std::sync::mpsc;
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let ctx = Ctx { home: d.path().to_path_buf(), now: Utc::now(), live: true };
+        let cache: Mutex<Option<CacheEntry>> = Mutex::new(None);
+        let seq = AtomicU64::new(0);
+        let good = Reading { percent_left: Some(42.0), resets_at: None, exact: true, note: "fresh".into() };
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            // Fetch A starts first, then stalls until released, then fails.
+            let a = s.spawn(|| {
+                let slow = move |_: &Ctx| -> Result<Reading, LiveError> {
+                    started_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Err(LiveError::soft("usage API returned HTTP 500"))
+                };
+                cached_reading_with(&cache, &seq, &ctx, &slow)
+            });
+            started_rx.recv().unwrap();
+            // Fetch B starts later and succeeds immediately.
+            let fast = |_: &Ctx| -> Result<Reading, LiveError> { Ok(good.clone()) };
+            assert_eq!(cached_reading_with(&cache, &seq, &ctx, &fast), good);
+            go_tx.send(()).unwrap();
+            let a_result = a.join().unwrap();
+            assert_eq!(a_result.percent_left, None); // A returns its own result...
+        });
+        // ...but does not replace B's newer reading in the cache.
+        let guard = cache.lock().unwrap();
+        assert_eq!(guard.as_ref().unwrap().reading, good);
+        drop(guard);
+        let never = |_: &Ctx| -> Result<Reading, LiveError> { panic!("should be served from cache") };
+        assert_eq!(cached_reading_with(&cache, &seq, &ctx, &never), good);
+    }
+
+    #[test]
     fn cache_invalidated_once_window_resets() {
         let now = t("2026-11-15T12:00:00Z");
         let ctx = Ctx { home: PathBuf::from("/h"), now, live: true };
         let mk = |reset: &str| CacheEntry {
+            seq: 1,
             at: Instant::now(),
             home: PathBuf::from("/h"),
             reading: Reading { percent_left: Some(5.0), resets_at: Some(t(reset)), exact: true, note: "x".into() },

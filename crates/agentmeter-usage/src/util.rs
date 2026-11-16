@@ -96,7 +96,14 @@ pub fn round1(v: f64) -> f64 {
 /// On timeout the child is killed and reaped, and an error is returned, so a
 /// subprocess waiting on user interaction (e.g. a Keychain prompt) cannot hang
 /// the caller. stdin/stderr are null; stdout is drained on a helper thread.
+///
+/// The child runs in its own process group, and the whole group is killed on
+/// timeout. Collecting stdout is also deadline-bound (the reader thread is
+/// detached if it doesn't finish), so a descendant that inherited the pipe
+/// can't block the caller.
 pub fn run_with_deadline(cmd: &mut Command, timeout: StdDuration) -> Result<Vec<u8>, String> {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -104,10 +111,11 @@ pub fn run_with_deadline(cmd: &mut Command, timeout: StdDuration) -> Result<Vec<
         .spawn()
         .map_err(|e| format!("could not start subprocess ({})", e.kind()))?;
     let mut stdout = child.stdout.take().ok_or("subprocess has no stdout")?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -119,12 +127,16 @@ pub fn run_with_deadline(cmd: &mut Command, timeout: StdDuration) -> Result<Vec<
         }
     };
     let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = reader.join();
+        kill_group(&mut child);
         return Err(format!("subprocess timed out after {}s", timeout.as_secs_f32()));
     };
-    let out = reader.join().unwrap_or_default();
+    // The child has exited; wait for stdout only for the remaining budget (plus
+    // a short grace period), then give up and detach the reader.
+    let grace = deadline.saturating_duration_since(Instant::now()) + StdDuration::from_millis(100);
+    let Ok(out) = rx.recv_timeout(grace) else {
+        kill_group(&mut child);
+        return Err(format!("subprocess output not closed within {}s", timeout.as_secs_f32()));
+    };
     if status.success() {
         Ok(out)
     } else {
@@ -132,10 +144,49 @@ pub fn run_with_deadline(cmd: &mut Command, timeout: StdDuration) -> Result<Vec<
     }
 }
 
+/// Kill the child's whole process group (best effort), then reap the child.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negative pid = process group (the child is its group leader).
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn deadline_holds_when_descendant_keeps_pipe_open() {
+        let start = Instant::now();
+        let r = run_with_deadline(
+            Command::new("/bin/sh").args(["-c", "sleep 30 & sleep 30"]),
+            StdDuration::from_millis(300),
+        );
+        assert!(r.is_err());
+        assert!(start.elapsed() < StdDuration::from_secs(3), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn deadline_holds_when_child_exits_but_descendant_lingers() {
+        // Parent exits right away; a background child still holds stdout.
+        let start = Instant::now();
+        let r = run_with_deadline(
+            Command::new("/bin/sh").args(["-c", "sleep 30 & echo hi"]),
+            StdDuration::from_millis(300),
+        );
+        assert!(r.is_err());
+        assert!(start.elapsed() < StdDuration::from_secs(3), "took {:?}", start.elapsed());
+    }
 
     #[test]
     fn deadline_kills_hung_subprocess() {
