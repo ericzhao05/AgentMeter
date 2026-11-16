@@ -28,9 +28,9 @@
  *     writes the whole object); the UI still converges to the stored state.
  *   - Opened in a normal browser (no window.__TAURI__), a mock backend is used: sample agents, and settings
  *     kept in localStorage under "agentmeter.settings". Usage drifts every few seconds to exercise live updates.
- *     Test hooks: URL params mockLoadDelay, mockSaveDelay (ms), mockFailLoad, mockFailSave (count), mockStaleRead,
+ *     Test hooks: URL params mockLoadDelay, mockSaveDelay (ms), mockFailLoad, mockFailSave (count), mockFailSaveMessage, mockStaleRead,
  *     mockNoEcho, and window.__agentmeterMock.{failNextSaves, failNextLoads, setSaveDelay, setLoadDelay,
- *     setStaleReads, setEcho, externalChange, read}.
+ *     setStaleReads, setEcho, externalChange, emitUsage, read}.
  */
 (() => {
   'use strict';
@@ -101,13 +101,15 @@
       saveDelay: +params.get('mockSaveDelay') || 60,
       failLoads: +params.get('mockFailLoad') || 0,   // number of get_settings calls to fail
       failSaves: +params.get('mockFailSave') || 0,   // number of save_settings calls to fail
+      failSaveMessage: params.get('mockFailSaveMessage'), // if set, failed saves reject with this string
       staleReads: params.has('mockStaleRead'),        // get_settings returns the state as of the call, not the reply
       echo: !params.has('mockNoEcho'),                // emit settings-changed after each successful save
     };
     const after = (ms, fn) => new Promise((res, rej) => setTimeout(() => { try { res(fn()); } catch (e) { rej(e); } }, ms));
     window.__agentmeterMock = {
       knobs,
-      failNextSaves(n = 1) { knobs.failSaves = n; },
+      failNextSaves(n = 1, message = null) { knobs.failSaves = n; knobs.failSaveMessage = message; },
+      emitUsage() { emit('usage-updated', usage.map(u => ({ ...u }))); },   // fire a usage update now
       failNextLoads(n = 1) { knobs.failLoads = n; },
       setSaveDelay(ms) { knobs.saveDelay = ms; },
       setLoadDelay(ms) { knobs.loadDelay = ms; },
@@ -132,7 +134,11 @@
         }
         if (cmd === 'get_usage') return after(60, () => usage.map(u => ({ ...u })));
         if (cmd === 'save_settings') return after(knobs.saveDelay, () => {
-          if (knobs.failSaves > 0) { knobs.failSaves--; throw new Error('mock: save_settings failed'); }
+          if (knobs.failSaves > 0) {
+            knobs.failSaves--;
+            if (knobs.failSaveMessage) throw knobs.failSaveMessage;   // like a Tauri command returning Err(String)
+            throw new Error('mock: save_settings failed');
+          }
           localStorage.setItem(KEY, JSON.stringify(args.settings));
           if (knobs.echo) setTimeout(() => emit('settings-changed', read()), 0);
           return null;
@@ -207,12 +213,18 @@
   async function pump() {
     if (saving) return;
     saving = true;
-    let failed = false, fresh = null, refreshFailed = false;
+    let failed = false, failMessage = null, fresh = null, refreshFailed = false;
     while (pendingSave) {
       const snap = pendingSave;
       pendingSave = null;
       try { await backend.invoke('save_settings', { settings: snap }); }
-      catch (err) { failed = true; console.error('save_settings failed', err); }
+      catch (err) {
+        failed = true;
+        // The backend rejects with a user-facing string when it refuses the write (e.g. a broken settings
+        // file: "fix it or use Reset Settings from the tray"); show that verbatim. Anything else is generic.
+        failMessage = typeof err === 'string' && err.trim() ? err.trim() : null;
+        console.error('save_settings failed', err);
+      }
     }
     if (!pendingSave) {
       try { fresh = await readAuthoritative(); }
@@ -221,8 +233,10 @@
     saving = false;
     if (pendingSave) { pump(); return; }
     if (fresh) { applySettings(fresh); hideError('refresh'); }
+    if (!failed) hideError('save');
     if (refreshFailed) { showError('refresh'); els.status.classList.remove('show'); }
     else showStatus(failed ? "Couldn't save" : 'Saved', failed);
+    if (failMessage && !refreshFailed) showError('save', failMessage);
   }
 
   function onSettingsChanged(payload) {
@@ -232,6 +246,7 @@
     if (!ready || saving || pendingSave) return;
     applySettings(latestEvent);
     hideError('refresh');
+    hideError('save');
   }
 
   /* ===== Agent list ===== */
@@ -252,39 +267,61 @@
     if (a.percentLeft == null) return 'usage unknown';
     return (a.exact ? '' : 'about ') + Math.round(a.percentLeft) + '% left';
   }
-  const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+  // Rows are built once and then updated in place, so a usage update landing between mousedown and
+  // mouseup cannot swallow a click, and VoiceOver keeps its position. The list is rebuilt only when
+  // the set of agent ids changes.
   function agentRow(a) {
-    const on = settings.agents.includes(a.id);
     const li = document.createElement('li');
     const key = a.id.replace(/[^a-z0-9_-]/gi, '_');
-    const sub = a.installed ? '' : (a.detected ? 'Not installed' : 'Not detected');
-    const pct = pctText(a);
     li.innerHTML = `
-      <button type="button" class="agent" role="switch" data-id="${esc(a.id)}" aria-checked="${on}"
-        aria-labelledby="name-${key}" ${sub || pct ? `aria-describedby="desc-${key}"` : ''}
-        ${!a.installed && !on ? 'disabled' : ''} style="--c:${colorFor(a.id)}">
+      <button type="button" class="agent" role="switch" aria-labelledby="name-${key}" style="--c:${colorFor(a.id)}">
         <i class="dot" aria-hidden="true"></i>
         <span class="who">
-          <span class="name" id="name-${key}">${esc(a.name)}</span>
-          ${sub ? `<span class="sub">${sub}</span>` : ''}
+          <span class="name" id="name-${key}"></span>
+          <span class="sub"></span>
         </span>
-        <span class="pct" aria-hidden="true">${pct}</span>
+        <span class="pct" aria-hidden="true"></span>
         <span class="switch" aria-hidden="true"></span>
-        <span id="desc-${key}" hidden>${sub || pctLabel(a)}</span>
+        <span class="desc" id="desc-${key}" hidden></span>
       </button>`;
+    li.firstElementChild.dataset.id = a.id;
     return li;
   }
 
+  const setText = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+  function updateRow(b, a) {
+    const on = settings.agents.includes(a.id);
+    const sub = a.installed ? '' : (a.detected ? 'Not installed' : 'Not detected');
+    const pct = pctText(a), desc = sub || pctLabel(a);
+    if (b.getAttribute('aria-checked') !== String(on)) b.setAttribute('aria-checked', String(on));
+    const disabled = !a.installed && !on;
+    if (b.disabled !== disabled) b.disabled = disabled;
+    setText(b.querySelector('.name'), a.name);
+    const subEl = b.querySelector('.sub');
+    setText(subEl, sub);
+    subEl.hidden = !sub;
+    setText(b.querySelector('.pct'), pct);
+    const descEl = b.querySelector('.desc');
+    setText(descEl, desc);
+    if (b.getAttribute('aria-describedby') !== descEl.id) b.setAttribute('aria-describedby', descEl.id);
+  }
+
   function render() {
-    const focusId = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null;
     const list = rows();
-    els.agents.replaceChildren(...list.map(agentRow));
-    els.empty.hidden = !ready || list.length > 0;
-    if (focusId) {
-      const b = [...els.agents.querySelectorAll('.agent')].find(x => x.dataset.id === focusId);
-      if (b && !b.disabled) b.focus({ preventScroll: true });
+    const ids = list.map(a => a.id).join('\n');
+    if (els.agents.dataset.ids !== ids) {
+      const focusId = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null;
+      els.agents.replaceChildren(...list.map(agentRow));
+      els.agents.dataset.ids = ids;
+      if (focusId) {
+        const b = [...els.agents.querySelectorAll('.agent')].find(x => x.dataset.id === focusId);
+        if (b) b.focus({ preventScroll: true });
+      }
     }
+    const buttons = els.agents.querySelectorAll('.agent');
+    list.forEach((a, i) => updateRow(buttons[i], a));
+    els.empty.hidden = !ready || list.length > 0;
   }
 
   els.agents.addEventListener('click', e => {
@@ -301,10 +338,14 @@
   const main = document.querySelector('main');
   const loadError = $('load-error');
   const loadErrorText = $('load-error-text');
-  let errorKind = null;   // 'load' (controls stay inert) | 'refresh' (controls stay usable)
-  function showError(kind) {
+  const loadRetry = $('load-retry');
+  // 'load' (controls stay inert, Retry) | 'refresh' (Retry) | 'save' (backend message, Dismiss)
+  let errorKind = null;
+  function showError(kind, message) {
     errorKind = kind;
-    loadErrorText.textContent = kind === 'load' ? "Couldn't load settings." : "Couldn't refresh settings.";
+    loadErrorText.textContent = kind === 'save' ? message
+      : kind === 'load' ? "Couldn't load settings." : "Couldn't refresh settings.";
+    loadRetry.textContent = kind === 'save' ? 'Dismiss' : 'Retry';
     loadError.hidden = false;
   }
   function hideError(kind) {
@@ -365,6 +406,10 @@
       if (!stale()) showError('refresh');
     }
   }
-  $('load-retry').addEventListener('click', () => (ready ? refreshSettings() : loadSettings()));
+  loadRetry.addEventListener('click', () => {
+    if (errorKind === 'save') hideError('save');
+    else if (ready) refreshSettings();
+    else loadSettings();
+  });
   init();
 })();
