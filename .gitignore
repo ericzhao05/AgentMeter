@@ -1,0 +1,11 @@
+# Rust / Tauri build output
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+Cargo.lock.bak
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

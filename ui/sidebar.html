@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AgentMeter</title>
+<link rel="stylesheet" href="tube.css">
+<link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+<main class="panel" id="panel">
+  <header class="bar">
+    <span class="title">AgentMeter</span>
+    <span class="demo" id="demo" hidden>demo</span>
+    <button type="button" id="settings" title="Settings" aria-label="Settings">⚙︎</button>
+    <button type="button" id="hide" title="Hide sidebar (show again from the menu bar)" aria-label="Hide">×</button>
+  </header>
+  <section class="tubes" id="tubes"></section>
+  <p class="empty" id="empty" hidden>No agents detected.<br>Open settings to choose some.</p>
+</main>
+<script src="tube.js"></script>
+<script src="sidebar.js"></script>
+</body>
+</html>
