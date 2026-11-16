@@ -609,12 +609,30 @@ impl Store {
     }
 
     /// Current state, loading it from disk on first use (or when the path changes).
+    /// Test-only: production reads go through `current`, which also clamps.
+    #[cfg(test)]
     fn snapshot(&self, path: Option<&Path>) -> LiveState {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if g.as_ref().map_or(true, |(p, _)| p.as_deref() != path) {
             *g = Some((path.map(Path::to_path_buf), load_state(path)));
         }
         g.as_ref().map(|(_, s)| s.clone()).unwrap_or_default()
+    }
+
+    /// Current state with wall-clock bounds applied to the *authoritative*
+    /// copy (under the mutex), persisting the correction if anything changed.
+    fn current(&self, path: Option<&Path>, now: DateTime<Utc>) -> LiveState {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_ref().map_or(true, |(p, _)| p.as_deref() != path) {
+            *g = Some((path.map(Path::to_path_buf), load_state(path)));
+        }
+        let st = &mut g.as_mut().expect("initialised above").1;
+        let before = st.backoff_until;
+        sanitize(st, now);
+        if st.backoff_until != before {
+            save_state(path, st);
+        }
+        st.clone()
     }
 
     fn update(&self, path: Option<&Path>, f: impl FnOnce(&mut LiveState)) -> LiveState {
@@ -676,8 +694,7 @@ fn cached_reading_with(store: &Store, ctx: &Ctx, fetch: LiveFetch, jitter01: f64
     let path = ctx.cache_dir.as_ref().map(|d| d.join(STATE_FILE));
     let path = path.as_deref();
     let current = |store: &Store| {
-        let mut st = store.snapshot(path);
-        sanitize(&mut st, now);
+        let mut st = store.current(path, now);
         note_reset(&mut st, now);
         st
     };
@@ -1175,6 +1192,49 @@ mod tests {
         let mut st = LiveState { backoff_until: Some(now + Duration::days(1)), ..Default::default() };
         sanitize(&mut st, now);
         assert_eq!(st.backoff_until, Some(now + Duration::seconds(RETRY_AFTER_MAX_SECS)));
+    }
+
+    #[test]
+    fn backward_clock_jump_unblocks_within_cap() {
+        let d = home_with_claude();
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::new();
+        let t0 = t("2026-11-15T12:00:00Z");
+        // Backoff starts (Retry-After 10 min) ...
+        cached_reading_with(&store, &live_ctx(d.path(), t0, Some(cache.path())), &rate_limited(Some("600")), 0.0);
+        // ... then the clock jumps back 24h.
+        let jumped = t0 - Duration::hours(24);
+        let ctx_at = |secs: i64| live_ctx(d.path(), jumped + Duration::seconds(secs), Some(cache.path()));
+        // Poll every 45 s; the API must not be hit until the 1h cap, and must be hit right after.
+        let mut secs = 0;
+        while secs < RETRY_AFTER_MAX_SECS {
+            cached_reading_with(&store, &ctx_at(secs), &never, 0.0);
+            secs += 45;
+        }
+        let r = cached_reading_with(&store, &ctx_at(RETRY_AFTER_MAX_SECS), &ok_reading(61.0, None), 0.0);
+        assert_eq!(r.percent_left, Some(61.0));
+        assert!(r.exact);
+        // The corrected deadline was persisted to the authoritative state/file.
+        let st = store.snapshot(Some(&cache.path().join(STATE_FILE)));
+        assert!(st.backoff_until.is_none() && st.failures == 0);
+    }
+
+    #[test]
+    fn clamp_is_applied_to_stored_state_and_persisted() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(STATE_FILE);
+        let now = t("2026-11-15T12:00:00Z");
+        let store = Store::new_with(LiveState { backoff_until: Some(now + Duration::hours(24)), ..Default::default() });
+        // new_with stores path None; use None for the in-memory check.
+        store.current(None, now);
+        assert_eq!(store.snapshot(None).backoff_until, Some(now + Duration::seconds(RETRY_AFTER_MAX_SECS)));
+        // With a file: the corrected deadline is written back.
+        fs::write(&path, serde_json::to_string(&LiveState { backoff_until: Some(Utc::now() + Duration::hours(24)), ..Default::default() }).unwrap()).unwrap();
+        let s2 = Store::new();
+        let n = Utc::now();
+        s2.current(Some(&path), n);
+        let on_disk: LiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(on_disk.backoff_until.unwrap() <= n + Duration::seconds(RETRY_AFTER_MAX_SECS));
     }
 
     #[test]
