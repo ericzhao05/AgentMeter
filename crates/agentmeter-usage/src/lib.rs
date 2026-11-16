@@ -69,6 +69,8 @@ pub(crate) struct Ctx {
     pub now: DateTime<Utc>,
     /// Allow network / Keychain access (Claude OAuth usage endpoint). Off in tests.
     pub live: bool,
+    /// Where adapters may persist small state files (no secrets). None = don't persist.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -81,13 +83,14 @@ impl Ctx {
 /// agent, installed or not. Per-adapter failures become `note` + `percent_left: None`.
 pub fn poll_all() -> Vec<AgentUsage> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    poll_with(&Ctx { home, now: Utc::now(), live: true })
+    let cache_dir = dirs::cache_dir().map(|d| d.join("agentmeter"));
+    poll_with(&Ctx { home, now: Utc::now(), live: true, cache_dir })
 }
 
 /// Same as [`poll_all`] but against an arbitrary home directory with network and
 /// Keychain access disabled (file-based sources only). Useful for tests/demos.
 pub fn poll_all_at(home: &Path) -> Vec<AgentUsage> {
-    poll_with(&Ctx { home: home.to_path_buf(), now: Utc::now(), live: false })
+    poll_with(&Ctx { home: home.to_path_buf(), now: Utc::now(), live: false, cache_dir: None })
 }
 
 pub(crate) fn poll_with(ctx: &Ctx) -> Vec<AgentUsage> {

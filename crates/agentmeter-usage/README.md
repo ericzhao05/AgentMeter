@@ -31,10 +31,15 @@ not it is installed. Adapter errors become a `note` with `percent_left: None`.
 Panics inside an adapter are caught.
 
 `poll_all` blocks the calling thread. Most calls finish in well under 100 ms.
-The exception is a Claude Code cache miss (about once every 60 s). That runs a
-Keychain lookup (3 s deadline) and an HTTP call (5 s timeout), and may also
-scan logs. From Tauri, call it
-from a background thread or `spawn_blocking`, not from the main thread.
+The exception is a Claude Code refresh (at most once every 5 minutes, and
+never during backoff). That runs a Keychain lookup (3 s deadline) and an HTTP
+call (5 s timeout), and may also scan logs. From Tauri, call it from a
+background thread or `spawn_blocking`, not from the main thread.
+
+`poll_all` persists a small Claude state file at
+`dirs::cache_dir()/agentmeter/claude-usage.json` (on macOS,
+`~/Library/Caches/agentmeter/`). It holds the last good reading, the backoff
+state, and the calibrated token budget. It never contains credentials.
 
 `mock_all(t)`: Claude Code drains from 100% to 10% over 90 s and then resets to
 100%. Codex oscillates around 60%. Gemini stays low (6–13%). Cursor is
@@ -98,21 +103,50 @@ Limitation: the value is only as fresh as the last Codex turn.
    - The Keychain lookup runs as a subprocess with a 3 s deadline. If it hangs
      (for example, waiting for access approval), it is killed and the row
      reports unknown with an error note, so other agents are still polled.
-   - Results are cached for 60 s, and the HTTP call has a 5 s timeout. The
-     cache lock is never held across the Keychain or HTTP call.
-   - A cached reading whose `resets_at` has passed is discarded and fetched
-     again. If no fresh exact reading is available, a reset window reports
-     100% with `exact = false`.
+   - The HTTP call has a 5 s timeout.
+   - **Gentle on the endpoint.** Claude Code itself also calls this endpoint,
+     and it rate-limits.
+     - A good reading is reused for **5 min**. Within 10 minutes of a window
+       reset, that drops to 60 s.
+     - Any failure starts a backoff. The adapter honours `Retry-After`
+       (seconds or HTTP-date, capped at 1 h). Without it, it waits
+       60 s → 2 m → 4 m → 8 m → 15 m (cap), with up to +20% jitter.
+     - **The API is never called during backoff.** Only one fetch runs at a
+       time, and no lock is held during the Keychain or HTTP call.
+   - **Serving during errors.** While the API is unavailable, the last good
+     exact reading is still shown with the same percentage, `exact = false`,
+     and a note like
+     `Last exact reading 6m ago; usage API rate-limited (HTTP 429), retrying in 2m`.
+   - **Reset since the last reading.** If the last reading's `resets_at` has
+     passed, the API is refetched promptly (unless in backoff).
+     - Meanwhile, the log estimate is used if it has evidence for the new
+       window.
+     - Otherwise the row shows 100% with `exact = false`.
+     - A last good reading without a reset time is dropped after 5 h.
+   - **Persistence.** The last good reading, failure count, backoff deadline
+     and calibrated budget are saved in the cache-dir JSON above. An app
+     restart therefore neither re-hits the API early nor loses the reading.
+     A corrupt file is ignored.
+     - Wall-clock values are bounded on every load and poll. A backoff more
+       than 1 h ahead is clamped to 1 h, and a reading dated more than 60 s
+       in the future counts as stale. A bad file or a clock jump can delay
+       fetching by at most 1 h.
+     - Saves write a temp file unique to the process and the write, fsync it,
+       then rename it into place. Two app instances never interleave writes.
+   - After a caller takes fetch ownership, it re-reads the state and re-checks
+     the backoff and TTL. A backoff started by a concurrent caller is never
+     bypassed.
 2. **Estimate fallback.** This runs when the API is unavailable (not logged in
-   with a subscription, offline, HTTP error), and also in `poll_all_at`.
+   with a subscription, offline, HTTP error) and there is no usable last good
+   reading. It is also used in `poll_all_at`, and is cached in memory for 60 s.
    - It rebuilds 5-hour session blocks from assistant `message.usage` records
      in `~/.claude/projects/**/*.jsonl` from the last 8 days, deduplicated by
      message id and request id.
    - A block starts at the minute of its first message. Tokens counted are
      input + output + cache-creation; cache reads are excluded.
    - The limit comes from one of two places:
-     - **Calibrated**: a token budget derived in-process from the last
-       successful exact reading (tokens used ÷ fraction used).
+     - **Calibrated**: a token budget derived from the last successful exact
+       reading (tokens used ÷ fraction used), persisted with the state.
      - Otherwise, **peak proxy**: the busiest completed block in the history.
    - If the current block is busier than the peak, it returns unknown rather
      than a made-up 0%.

@@ -173,7 +173,7 @@ mod tests {
     }
 
     fn ctx(home: &Path, now: DateTime<Utc>) -> Ctx {
-        Ctx { home: home.to_path_buf(), now, live: false }
+        Ctx { home: home.to_path_buf(), now, live: false, cache_dir: None }
     }
 
     #[test]
