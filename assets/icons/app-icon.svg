@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- AgentMeter app icon: a cel-shaded glass tube with neon caps, after the burette mockup.
+       Follows the macOS icon grid: 824px rounded square centred on a 1024 transparent canvas. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26262c"/>
+      <stop offset="1" stop-color="#121214"/>
+    </linearGradient>
+    <radialGradient id="aura" cx=".5" cy=".62" r=".42">
+      <stop offset="0" stop-color="#8CFF3A" stop-opacity=".30"/>
+      <stop offset="1" stop-color="#8CFF3A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity=".20"/>
+      <stop offset=".12" stop-color="#fff" stop-opacity=".07"/>
+      <stop offset=".5" stop-color="#fff" stop-opacity=".03"/>
+      <stop offset=".88" stop-color="#fff" stop-opacity=".07"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".16"/>
+    </linearGradient>
+    <linearGradient id="liq" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#8CFF3A"/>
+      <stop offset=".85" stop-color="#3FCF1A"/>
+      <stop offset="1" stop-color="#5BD82B"/>
+    </linearGradient>
+    <linearGradient id="liqShade" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#1d5a0c" stop-opacity=".55"/>
+      <stop offset=".18" stop-color="#1d5a0c" stop-opacity="0"/>
+      <stop offset=".28" stop-color="#fff" stop-opacity="0"/>
+      <stop offset=".36" stop-color="#fff" stop-opacity=".18"/>
+      <stop offset=".46" stop-color="#fff" stop-opacity="0"/>
+      <stop offset=".78" stop-color="#1d5a0c" stop-opacity="0"/>
+      <stop offset="1" stop-color="#1d5a0c" stop-opacity=".55"/>
+    </linearGradient>
+    <clipPath id="inside"><rect x="398" y="300" width="228" height="424"/></clipPath>
+    <filter id="neonBlur" x="-30%" y="-200%" width="160%" height="500%"><feGaussianBlur stdDeviation="16"/></filter>
+    <filter id="softBlur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="40"/></filter>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <rect x="104" y="104" width="816" height="816" rx="182" fill="none" stroke="#0A0A0C" stroke-width="8"/>
+  <rect x="116" y="116" width="792" height="792" rx="172" fill="none" stroke="#fff" stroke-opacity=".06" stroke-width="4"/>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#aura)"/>
+
+  <!-- Liquid light spilling on the tile -->
+  <rect x="400" y="470" width="224" height="250" fill="#8CFF3A" opacity=".22" filter="url(#softBlur)"/>
+
+  <!-- Glass body -->
+  <rect x="388" y="290" width="248" height="444" fill="#18181b" stroke="#0A0A0C" stroke-width="12" stroke-linejoin="round"/>
+
+  <!-- Liquid -->
+  <g clip-path="url(#inside)">
+    <rect x="398" y="470" width="228" height="260" fill="url(#liq)"/>
+    <rect x="398" y="470" width="228" height="260" fill="url(#liqShade)"/>
+    <ellipse cx="512" cy="470" rx="116" ry="18" fill="#BFFF8C"/>
+    <path d="M396 470a116 18 0 0 0 232 0" fill="none" stroke="#E2FFC9" stroke-width="10" stroke-linecap="round"/>
+    <!-- bubbles -->
+    <g stroke="#1d5a0c" stroke-width="3">
+      <circle cx="548" cy="560" r="17" fill="#BFFF8C"/>
+      <circle cx="486" cy="620" r="11" fill="#BFFF8C"/>
+      <circle cx="560" cy="660" r="8" fill="#BFFF8C"/>
+    </g>
+    <ellipse cx="541" cy="553" rx="6" ry="4" fill="#fff" transform="rotate(-38 541 553)"/>
+  </g>
+
+  <!-- Glass tint over everything inside -->
+  <rect x="394" y="296" width="236" height="432" fill="url(#glass)"/>
+
+  <!-- Ticks -->
+  <g stroke="#fff" stroke-width="10" stroke-linecap="round" opacity=".7">
+    <line x1="424" x2="468" y1="450" y2="450"/>
+    <line x1="424" x2="452" y1="520" y2="520"/>
+    <line x1="424" x2="468" y1="590" y2="590"/>
+    <line x1="424" x2="452" y1="660" y2="660"/>
+  </g>
+
+  <!-- Glass highlights: bright left edge, faint right edge, teardrop -->
+  <g fill="none" stroke="#fff" stroke-linecap="round">
+    <path d="M403 336V690" stroke-width="10" opacity=".95"/>
+    <path d="M621 336V690" stroke-width="6" opacity=".5"/>
+  </g>
+  <path d="M432 392c1-10-3-17-3-26 0-13 18-15 18-2 0 9-10 14-15 28z" fill="#fff" opacity=".95"/>
+
+  <!-- Top cap (light from above) -->
+  <g stroke="#0A0A0C" stroke-width="10" stroke-linejoin="round">
+    <polygon points="440,168 584,168 604,198 420,198" fill="#5A5A64"/>
+    <polygon points="420,198 604,198 614,216 410,216" fill="#38383E"/>
+    <polygon points="330,216 694,216 714,242 310,242" fill="#4A4A52"/>
+    <polygon points="310,242 714,242 714,278 672,306 352,306 310,278" fill="#2A2A2E"/>
+    <polygon points="352,306 672,306 650,322 374,322" fill="#151517"/>
+  </g>
+  <g fill="none" stroke="#D2D2DC" stroke-width="5" stroke-linecap="round" opacity=".9">
+    <polyline points="446,175 578,175"/>
+    <polyline points="338,223 686,223"/>
+  </g>
+
+  <!-- Bottom cap (mirrored, shades swapped so light still comes from above) -->
+  <g stroke="#0A0A0C" stroke-width="10" stroke-linejoin="round">
+    <polygon points="440,856 584,856 604,826 420,826" fill="#151517"/>
+    <polygon points="420,826 604,826 614,808 410,808" fill="#38383E"/>
+    <polygon points="330,808 694,808 714,782 310,782" fill="#151517"/>
+    <polygon points="310,782 714,782 714,746 672,718 352,718 310,746" fill="#2A2A2E"/>
+    <polygon points="352,718 672,718 650,702 374,702" fill="#4A4A52"/>
+  </g>
+  <g fill="none" stroke="#D2D2DC" stroke-width="5" stroke-linecap="round" opacity=".9">
+    <polyline points="380,708 644,708"/>
+  </g>
+
+  <!-- Neon strips: halo, colour body, hot core -->
+  <g stroke-linecap="round">
+    <g stroke="#D946EF" stroke-width="48" opacity=".85" filter="url(#neonBlur)">
+      <line x1="376" y1="264" x2="648" y2="264"/>
+      <line x1="376" y1="760" x2="648" y2="760"/>
+    </g>
+    <g stroke="#D946EF" stroke-width="22">
+      <line x1="376" y1="264" x2="648" y2="264"/>
+      <line x1="376" y1="760" x2="648" y2="760"/>
+    </g>
+    <g stroke="#F6CDFB" stroke-width="10">
+      <line x1="376" y1="264" x2="648" y2="264"/>
+      <line x1="376" y1="760" x2="648" y2="760"/>
+    </g>
+  </g>
+</svg>

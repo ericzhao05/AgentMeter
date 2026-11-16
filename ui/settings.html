@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>AgentMeter Settings</title>
+<link rel="stylesheet" href="settings.css">
+</head>
+<body>
+
+<header class="top">
+  <h1>Settings</h1>
+  <p class="status" id="status" role="status" aria-live="polite"></p>
+</header>
+
+<main>
+  <!-- ===== Sidebar layout ===== -->
+  <section class="panel" aria-labelledby="layout-title">
+    <h2 id="layout-title">Sidebar</h2>
+
+    <div class="row">
+      <span class="label" id="tubes-label">Tubes</span>
+      <div class="seg seg-count" id="tube-count" role="radiogroup" aria-labelledby="tubes-label"></div>
+    </div>
+
+    <div class="slots" id="slots" aria-hidden="true"></div>
+
+    <div class="row">
+      <span class="label" id="dock-label">Dock edge</span>
+      <div class="seg" id="dock-edge" role="radiogroup" aria-labelledby="dock-label">
+        <button type="button" role="radio" data-edge="left">Left</button><button type="button" role="radio" data-edge="right">Right</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="label" for="demo-mode" id="demo-label">Demo mode</label>
+      <button type="button" class="switch" id="demo-mode" role="switch" aria-checked="false" aria-describedby="demo-hint">
+        <span class="knob" aria-hidden="true"></span>
+      </button>
+    </div>
+    <p class="hint" id="demo-hint">Fills the tubes with simulated levels instead of real usage.</p>
+  </section>
+
+  <!-- ===== Agents ===== -->
+  <section class="panel" aria-labelledby="agents-title">
+    <div class="panel-head">
+      <h2 id="agents-title">Agents</h2>
+      <span class="count" id="agent-count"></span>
+    </div>
+    <p class="hint" id="agents-hint">Tick the agents to show, then drag or use the arrows to set their order, top to bottom.</p>
+    <ol class="agents" id="agents" aria-describedby="agents-hint"></ol>
+    <p class="empty" id="agents-empty" hidden>No agents detected yet.</p>
+  </section>
+</main>
+
+<p class="sr-only" id="announcer" aria-live="assertive"></p>
+
+<script src="settings.js"></script>
+</body>
+</html>
