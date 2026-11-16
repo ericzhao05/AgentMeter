@@ -30,7 +30,7 @@
  *     kept in localStorage under "agentmeter.settings". Usage drifts every few seconds to exercise live updates.
  *     Test hooks: URL params mockLoadDelay, mockSaveDelay (ms), mockFailLoad, mockFailSave (count), mockFailSaveMessage, mockStaleRead,
  *     mockNoEcho, and window.__agentmeterMock.{failNextSaves, failNextLoads, setSaveDelay, setLoadDelay,
- *     setStaleReads, setEcho, externalChange, emitUsage, read}.
+ *     setStaleReads, setEcho, externalChange, emitUsage, patchUsage, read}.
  */
 (() => {
   'use strict';
@@ -110,6 +110,7 @@
       knobs,
       failNextSaves(n = 1, message = null) { knobs.failSaves = n; knobs.failSaveMessage = message; },
       emitUsage() { emit('usage-updated', usage.map(u => ({ ...u }))); },   // fire a usage update now
+      patchUsage(id, patch) { Object.assign(usage.find(u => u.id === id) || {}, patch); this.emitUsage(); },
       failNextLoads(n = 1) { knobs.failLoads = n; },
       setSaveDelay(ms) { knobs.saveDelay = ms; },
       setLoadDelay(ms) { knobs.loadDelay = ms; },
@@ -258,13 +259,14 @@
     return list;
   }
 
+  // Installed agents whose usage can't be read get no tube in the sidebar (it shows a notice instead);
+  // here they get a muted "Usage unavailable" hint and stay switchable.
+  const usageUnavailable = a => a.installed && a.percentLeft == null;
   function pctText(a) {
-    if (!a.installed) return '';
-    if (a.percentLeft == null) return '?';
+    if (!a.installed || a.percentLeft == null) return '';
     return (a.exact ? '' : '~') + Math.round(a.percentLeft) + '%';
   }
   function pctLabel(a) {
-    if (a.percentLeft == null) return 'usage unknown';
     return (a.exact ? '' : 'about ') + Math.round(a.percentLeft) + '% left';
   }
 
@@ -292,8 +294,13 @@
   const setText = (el, text) => { if (el.textContent !== text) el.textContent = text; };
   function updateRow(b, a) {
     const on = settings.agents.includes(a.id);
-    const sub = a.installed ? '' : (a.detected ? 'Not installed' : 'Not detected');
-    const pct = pctText(a), desc = sub || pctLabel(a);
+    const unavailable = usageUnavailable(a);
+    const note = typeof a.note === 'string' ? a.note.trim() : '';
+    const sub = !a.installed ? (a.detected ? 'Not installed' : 'Not detected') : unavailable ? 'Usage unavailable' : '';
+    const pct = pctText(a);
+    const desc = unavailable && note ? `${sub}. ${note}` : sub || pctLabel(a);
+    const title = unavailable ? note : '';
+    if ((b.getAttribute('title') || '') !== title) { if (title) b.title = title; else b.removeAttribute('title'); }
     if (b.getAttribute('aria-checked') !== String(on)) b.setAttribute('aria-checked', String(on));
     const disabled = !a.installed && !on;
     if (b.disabled !== disabled) b.disabled = disabled;
