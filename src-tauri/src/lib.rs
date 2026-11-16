@@ -3,7 +3,7 @@ mod settings;
 use agentmeter_usage as usage;
 
 use settings::{DockEdge, Settings};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +52,8 @@ struct AppState {
     move_gen: AtomicU64,
     /// Last user-drag activity (drag start, or a Move event while a drag is live).
     drag_seen: Mutex<Option<Instant>>,
+    /// A scale/monitor change arrived mid-drag; re-fit once the drag ends.
+    refit_after_drag: AtomicBool,
 }
 
 const DRAG_QUIET: Duration = Duration::from_millis(600);
@@ -307,13 +309,13 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
     let st = state.clone();
     w.on_window_event(move |e| {
         // Monitor / scale change (e.g. moved to another display, resolution changed): re-fit.
+        // Never during a user drag (e.g. dragging between displays with different scaling):
+        // remember it and re-fit once the drag ends.
         if let WindowEvent::ScaleFactorChanged { .. } = e {
-            if let Some(w) = handle.get_webview_window(SIDEBAR) {
-                if let (Ok(p), Ok(sz), Ok(sf)) = (w.outer_position(), w.outer_size(), w.scale_factor()) {
-                    let (p, sz) = (p.to_logical::<f64>(sf), sz.to_logical::<f64>(sf));
-                    let edge = st.store.lock().unwrap().settings.dock_edge;
-                    keep_on_screen(&w, edge, p.x, p.y, sz.width);
-                }
+            if st.dragging() {
+                st.refit_after_drag.store(true, Ordering::SeqCst);
+            } else {
+                refit_sidebar(&handle, &st);
             }
         }
         if let WindowEvent::Moved(_) = e {
@@ -326,9 +328,14 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
             let gen = st.move_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let (handle, st) = (handle.clone(), st.clone());
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(600));
+                std::thread::sleep(DRAG_QUIET + Duration::from_millis(50));
                 if st.move_gen.load(Ordering::SeqCst) != gen {
                     return;
+                }
+                // Movement stopped: if a scale change was deferred during a drag, re-fit now.
+                if !st.dragging() && st.refit_after_drag.swap(false, Ordering::SeqCst) {
+                    let (h, s2) = (handle.clone(), st.clone());
+                    let _ = handle.run_on_main_thread(move || refit_sidebar(&h, &s2));
                 }
                 if let Some(w) = handle.get_webview_window(SIDEBAR) {
                     if let (Ok(p), Ok(sf)) = (w.outer_position(), w.scale_factor()) {
@@ -340,6 +347,17 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
         }
     });
     Ok(w)
+}
+
+/// Keep the sidebar fully on a screen at its current position (after a scale/monitor change).
+fn refit_sidebar(app: &AppHandle, st: &AppState) {
+    if let Some(w) = app.get_webview_window(SIDEBAR) {
+        if let (Ok(p), Ok(sz), Ok(sf)) = (w.outer_position(), w.outer_size(), w.scale_factor()) {
+            let (p, sz) = (p.to_logical::<f64>(sf), sz.to_logical::<f64>(sf));
+            let edge = st.store.lock().unwrap().settings.dock_edge;
+            keep_on_screen(&w, edge, p.x, p.y, sz.width);
+        }
+    }
 }
 
 fn show_settings(app: &AppHandle) -> tauri::Result<()> {
@@ -497,6 +515,7 @@ pub fn run() {
                 wake_poller: Mutex::new(tx),
                 move_gen: AtomicU64::new(0),
                 drag_seen: Mutex::new(None),
+                refit_after_drag: AtomicBool::new(false),
             });
             app.manage(state.clone());
 
