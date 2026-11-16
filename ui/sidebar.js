@@ -122,7 +122,6 @@ setInterval(() => document.querySelectorAll('.reset[data-iso]').forEach(el => { 
 
 $('settings').addEventListener('click', () => invoke('open_settings').catch(console.error));
 $('empty-settings').addEventListener('click', () => invoke('open_settings').catch(console.error));
-$('hide').addEventListener('click', () => appWindow.hide());
 // Drag the sidebar from anywhere except its buttons.
 $('panel').addEventListener('mousedown', e => {
   if (e.button === 0 && !e.target.closest('button')) {
@@ -131,10 +130,26 @@ $('panel').addEventListener('mousedown', e => {
   }
 });
 
+/* Auto-hide: the backend watches the cursor and says when the sidebar is slid in (shown) and when the
+   cursor is over it (hover: light background + gear). While slid out, the tube animation is paused. */
+const SLIDE_MS = 220;
+let pauseTimer = 0;
+function applySidebarState({ shown, hover }) {
+  const panel = $('panel');
+  panel.classList.toggle('shown', shown);
+  panel.classList.toggle('hover', shown && hover);
+  clearTimeout(pauseTimer);
+  if (shown) window.tubeLoop.resume();
+  else pauseTimer = setTimeout(() => window.tubeLoop.pause(), SLIDE_MS);   // after the slide-out finishes
+}
+
 // Listen first, then fetch the initial snapshots. A snapshot is applied only if no event for that
 // stream arrived after its request started (otherwise the event is newer and wins).
-let settingsRev = 0, usageRev = 0;
+let settingsRev = 0, usageRev = 0, visRev = 0;
 (async () => {
+  await listen('sidebar-state', e => { visRev++; applySidebarState(e.payload); });
+  const vRev = visRev;
+  invoke('get_sidebar_state').then(v => { if (visRev === vRev) applySidebarState(v); }).catch(console.error);
   await listen('usage-updated', e => { usageRev++; usage = e.payload; render(); });
   await listen('settings-changed', e => { settingsRev++; settingsKnown = true; settings = e.payload; render(); });
   const sRev = settingsRev, uRev = usageRev;

@@ -443,15 +443,21 @@ function createTube(config = {}) {
 
 /* ===== One shared animation loop for every tube (a single still frame under reduced motion) ===== */
 let lastFrame = 0;
-const tubeLoop = { maxFps: 60 };                                       // AgentMeter: the sidebar caps this to save GPU
+// AgentMeter additions: the sidebar caps the frame rate, and pauses the loop entirely while hidden.
+const tubeLoop = {
+  maxFps: 60, paused: false,
+  pause() { this.paused = true; },
+  resume() { if (!this.paused) return; this.paused = false; lastFrame = 0; if (!reduced.matches) requestAnimationFrame(frame); },
+};
 function frame(now) {
+  if (tubeLoop.paused) return;                                         // loop stops; resume() restarts it
   if (!reduced.matches && lastFrame && now - lastFrame < 1000 / tubeLoop.maxFps - 2) { requestAnimationFrame(frame); return; }
   const dt = reduced.matches ? 0 : Math.min(.05, (now - lastFrame) / 1000);
   lastFrame = now;
   for (const tube of tubes) tube.step(dt, now / 1000);
   if (!reduced.matches) requestAnimationFrame(frame);
 }
-reduced.addEventListener('change', () => { tubes.forEach(tube => tube.seedBubbles()); requestAnimationFrame(frame); });
+reduced.addEventListener('change', () => { tubes.forEach(tube => tube.seedBubbles()); if (!tubeLoop.paused) requestAnimationFrame(frame); });
 requestAnimationFrame(frame);
 
 window.createTube = createTube;

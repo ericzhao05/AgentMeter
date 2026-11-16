@@ -32,9 +32,22 @@ cargo tauri dev        # run in development
 cargo tauri build      # produce AgentMeter.app / .dmg
 ```
 
-AgentMeter runs as a menu-bar app (no Dock icon). Use the tray menu for **Show/Hide Sidebar**,
-**Settings…** and **Quit**. The sidebar docks to the right screen edge by default; drag it anywhere
-and its position is remembered.
+AgentMeter runs as a menu-bar app (no Dock icon). The tray menu has **Show/Hide Sidebar**,
+**Settings…** and **Quit**.
+
+### Using the sidebar
+
+- **Reveal:** the tubes stay hidden just off the right edge of the screen. Push the mouse against the
+  rightmost edge of the screen, level with the sidebar, and they slide in. Move away and they slide
+  back out after about half a second. On launch (and after tray **Show**) they appear briefly so you
+  know where they are.
+- **Hover:** the sidebar has no background, just tubes and labels. While the mouse is over it, a light
+  grey panel and the ⚙︎ settings button appear.
+- **Move:** drag the sidebar up or down; it snaps back to the right edge and remembers its height
+  across restarts. With several displays it docks to the right edge of the display you drop it on.
+- **Off entirely:** tray **Show/Hide Sidebar** turns edge reveal off; choose it again to turn it back on.
+- While hidden, the sidebar lets clicks through to the apps underneath and pauses its animation.
+  With "Reduce motion" on, it appears and disappears without sliding.
 
 ### Demo mode (development)
 
@@ -60,8 +73,8 @@ Stored as JSON in the app config dir (`~/Library/Application Support/com.agentme
 { "agents": ["claude-code", "codex"], "tubeCount": 4, "demoMode": false, "dockEdge": "right" }
 ```
 
-`tubeCount` and `demoMode` are legacy fields kept for compatibility and ignored (demo mode comes
-from `AGENTMETER_DEMO`). If the file is unreadable it is kept as `settings.json.corrupt-…`
+`tubeCount`, `demoMode` and `dockEdge` are legacy fields kept for compatibility and ignored (demo mode
+comes from `AGENTMETER_DEMO`; the sidebar always docks to the right edge). If the file is unreadable it is kept as `settings.json.corrupt-…`
 before anything is written; if even that fails, saving is refused and the menu-bar icon offers
 **Reset Settings**.
 
@@ -69,5 +82,5 @@ before anything is written; if even that fails, saving is refused and the menu-b
 
 - `invoke('get_usage')` → `AgentUsage[]` (latest cached poll, or demo data in demo mode)
 - `invoke('get_settings')` → `Settings`; `invoke('save_settings', { settings })` persists and emits `settings-changed`
-- `invoke('open_settings')`, `invoke('resize_sidebar', { tubes })`, `invoke('drag_began')` (sidebar internals)
-- events: `usage-updated` (`AgentUsage[]`, every ~45 s, every 2 s in demo mode), `settings-changed` (`Settings`)
+- `invoke('open_settings')`, `invoke('resize_sidebar', { tubes })`, `invoke('drag_began')`, `invoke('get_sidebar_state')` (sidebar internals)
+- events: `usage-updated` (`AgentUsage[]`, every ~45 s, every 2 s in demo mode), `settings-changed` (`Settings`), `sidebar-state` (`{ shown, hover }`, auto-hide)
