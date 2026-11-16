@@ -183,8 +183,9 @@ function applySidebarState({ shown, hover, edge }) {
   panel.classList.toggle('shown', shown);
   panel.classList.toggle('hover', shown && hover);
   clearTimeout(pauseTimer);
-  if (shown) window.tubeLoop.resume();
-  else pauseTimer = setTimeout(() => window.tubeLoop.pause(), SLIDE_MS);   // after the slide-out finishes
+  // Keep the slide the only thing animating: tubes resume after the slide-in and pause after the
+  // slide-out (resuming at the start of the slide caused a long first frame).
+  pauseTimer = setTimeout(() => (shown ? window.tubeLoop.resume() : window.tubeLoop.pause()), SLIDE_MS);
 }
 
 // Listen first, then fetch the initial snapshots. A snapshot is applied only if no event for that

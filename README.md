@@ -8,8 +8,9 @@ Under each tube: the agent name, the percentage left and, when known, when the l
 (e.g. `Limit resets in 2h 15min`).
 
 - `~62%` — an estimate (the agent doesn't expose an exact figure)
-- Big `?` inside a dimmed, empty tube, labelled "Usage unavailable" — usage couldn't be read;
-  AgentMeter never invents numbers (hover the tube for the reason)
+- No tube, but a small "Couldn't read usage: Gemini, Cursor" notice at the top of the sidebar —
+  usage couldn't be read; AgentMeter never invents numbers (hover the notice for the reasons). The
+  tube appears by itself once the usage becomes readable
 - Bubbling liquid — the agent is working right now
 - Pouring refill — the limit window just reset
 
@@ -37,14 +38,15 @@ AgentMeter runs as a menu-bar app (no Dock icon). The tray menu has **Show/Hide 
 
 ### Using the sidebar
 
-- **Reveal:** the tubes stay hidden just off the right edge of the screen. Push the mouse against the
-  rightmost edge of the screen, level with the sidebar, and they slide in. Move away and they slide
+- **Reveal:** the tubes stay hidden just off the edge of the screen they're docked to (right by
+  default). Push the mouse against that edge of the screen, level with the sidebar, and they slide in. Move away and they slide
   back out after about half a second. On launch (and after tray **Show**) they appear briefly so you
   know where they are.
 - **Hover:** the sidebar has no background, just tubes and labels. While the mouse is over it, a light
   grey panel and the ⚙︎ settings button appear.
-- **Move:** drag the sidebar up or down; it snaps back to the right edge and remembers its height
-  across restarts. With several displays it docks to the right edge of the display you drop it on.
+- **Move:** drag the sidebar anywhere and let go: dropped in the left half of a display it glides to
+  that display's left edge, in the right half to the right edge, and then slides out of view. The
+  edge and height are remembered across restarts.
 - **Off entirely:** tray **Show/Hide Sidebar** turns edge reveal off; choose it again to turn it back on.
 - While hidden, the sidebar lets clicks through to the apps underneath and pauses its animation.
   With "Reduce motion" on, it appears and disappears without sliding.
@@ -73,8 +75,8 @@ Stored as JSON in the app config dir (`~/Library/Application Support/com.agentme
 { "agents": ["claude-code", "codex"], "tubeCount": 4, "demoMode": false, "dockEdge": "right" }
 ```
 
-`tubeCount`, `demoMode` and `dockEdge` are legacy fields kept for compatibility and ignored (demo mode
-comes from `AGENTMETER_DEMO`; the sidebar always docks to the right edge). If the file is unreadable it is kept as `settings.json.corrupt-…`
+`dockEdge` is set by dragging the sidebar (there's no settings control for it). `tubeCount` and
+`demoMode` are legacy fields kept for compatibility and ignored (demo mode comes from `AGENTMETER_DEMO`). If the file is unreadable it is kept as `settings.json.corrupt-…`
 before anything is written; if even that fails, saving is refused and the menu-bar icon offers
 **Reset Settings**.
 
@@ -82,5 +84,5 @@ before anything is written; if even that fails, saving is refused and the menu-b
 
 - `invoke('get_usage')` → `AgentUsage[]` (latest cached poll, or demo data in demo mode)
 - `invoke('get_settings')` → `Settings`; `invoke('save_settings', { settings })` persists and emits `settings-changed`
-- `invoke('open_settings')`, `invoke('resize_sidebar', { tubes })`, `invoke('drag_began')`, `invoke('get_sidebar_state')` (sidebar internals)
-- events: `usage-updated` (`AgentUsage[]`, every ~45 s, every 2 s in demo mode), `settings-changed` (`Settings`), `sidebar-state` (`{ shown, hover }`, auto-hide)
+- `invoke('open_settings')`, `invoke('resize_sidebar', { tubes })`, `invoke('drag_began')`, `invoke('get_sidebar_state')`, `invoke('dev_log', { msg })` (sidebar internals)
+- events: `usage-updated` (`AgentUsage[]`, every ~45 s, every 2 s in demo mode), `settings-changed` (`Settings`), `sidebar-state` (`{ shown, hover, edge }`, auto-hide)
