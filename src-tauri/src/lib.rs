@@ -3,7 +3,7 @@ mod settings;
 use agentmeter_usage as usage;
 
 use settings::{DockEdge, Settings};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,7 +56,8 @@ struct AppState {
     store: Mutex<SettingsStore>,
     usage: Mutex<UsageCache>,
     wake_poller: Mutex<Sender<()>>,
-    move_gen: AtomicU64,
+    /// Tray menu + its "Reset Settings" item, present only while settings writes are blocked.
+    reset_item: Mutex<Option<(Menu<tauri::Wry>, MenuItem<tauri::Wry>)>>,
     /// Last window movement (every Move event, plus the sidebar's drag start).
     drag_seen: Mutex<Option<Instant>>,
     /// A scale/monitor change arrived mid-drag; a deferred re-fit is scheduled.
@@ -137,6 +138,7 @@ fn persist(app: &AppHandle, state: &AppState, settings: Settings) -> Result<Sett
             Ok(kept) => {
                 eprintln!("[agentmeter] settings file preserved at {kept:?}; writes unblocked");
                 store.blocked = None;
+                remove_reset_item(app, state);
             }
             Err(_) => return Err(msg),
         }
@@ -151,12 +153,19 @@ fn persist(app: &AppHandle, state: &AppState, settings: Settings) -> Result<Sett
 
 /// Explicit user reset (tray item, offered only when settings writes are blocked): overwrite
 /// the unpreservable file with defaults and re-seed the agent list from the next real poll.
+/// A no-op unless writes are still blocked (a stale menu item can't wipe a working setup).
 fn reset_settings(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>().inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = state.store.lock().unwrap();
+        if store.blocked.is_none() {
+            remove_reset_item(&app, &state);
+            return;
+        }
         let fresh = Settings { demo_mode: state.demo, ..Settings::default() };
+        let old_edge = store.settings.dock_edge;
+        let old_file_demo = store.file_demo_mode;
         store.file_demo_mode = false;
         match store.write(&app, &fresh) {
             Ok(()) => {
@@ -165,10 +174,33 @@ fn reset_settings(app: &AppHandle) {
                 store.settings = fresh;
                 let _ = app.emit("settings-changed", &store.settings);
                 let _ = state.wake_poller.lock().unwrap().send(());
+                remove_reset_item(&app, &state);
+                // Demo mode is env-only, so there is no mode to re-apply; re-dock if the edge changed.
+                let edge = store.settings.dock_edge;
+                if edge != old_edge {
+                    let a = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if let Some(w) = a.get_webview_window(SIDEBAR) {
+                            dock(&w, edge, None);
+                        }
+                    });
+                }
             }
-            Err(e) => eprintln!("[agentmeter] reset failed: {e}"),
+            Err(e) => {
+                store.file_demo_mode = old_file_demo;
+                eprintln!("[agentmeter] reset failed: {e}");
+            }
         }
     });
+}
+
+/// Take the "Reset Settings" item out of the tray menu (once writes are unblocked).
+fn remove_reset_item(app: &AppHandle, state: &AppState) {
+    if let Some((menu, item)) = state.reset_item.lock().unwrap().take() {
+        let _ = app.run_on_main_thread(move || {
+            let _ = menu.remove(&item);
+        });
+    }
 }
 
 #[tauri::command]
@@ -194,6 +226,10 @@ fn resize_sidebar(window: WebviewWindow, state: tauri::State<'_, Arc<AppState>>,
     let pos = window.outer_position().map_err(|e| e.to_string())?.to_logical::<f64>(scale);
     window.set_size(LogicalSize::new(w, SIDEBAR_H)).map_err(|e| e.to_string())?;
     if state.user_dragging() {
+        // A button is held (maybe a drag): don't move it now, re-fit once it's released.
+        if !state.refit_after_drag.swap(true, Ordering::SeqCst) {
+            schedule_refit(window.app_handle().clone(), state.inner().clone());
+        }
         return Ok(());
     }
     let edge = state.store.lock().unwrap().settings.dock_edge;
@@ -291,7 +327,28 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
     }
     w.show()?;
 
-    // Remember where the user drags it (debounced: write once the window stops moving).
+    // Remember where the user drags it: one long-lived thread, fed a tick per Move event, saves the
+    // position once moves have been quiet for a moment.
+    let (move_tx, move_rx) = mpsc::channel::<()>();
+    let saver = app.clone();
+    std::thread::spawn(move || loop {
+        if move_rx.recv().is_err() {
+            return;
+        }
+        loop {
+            match move_rx.recv_timeout(DRAG_QUIET + Duration::from_millis(50)) {
+                Ok(()) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        if let Some(w) = saver.get_webview_window(SIDEBAR) {
+            if let (Ok(p), Ok(sf)) = (w.outer_position(), w.scale_factor()) {
+                let p = p.to_logical::<f64>(sf);
+                settings::save_position(&saver, p.x, p.y);
+            }
+        }
+    });
     let handle = app.clone();
     let st = state.clone();
     w.on_window_event(move |e| {
@@ -309,20 +366,7 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
         }
         if let WindowEvent::Moved(_) = e {
             *st.drag_seen.lock().unwrap() = Some(Instant::now()); // every move renews the marker
-            let gen = st.move_gen.fetch_add(1, Ordering::SeqCst) + 1;
-            let (handle, st) = (handle.clone(), st.clone());
-            std::thread::spawn(move || {
-                std::thread::sleep(DRAG_QUIET + Duration::from_millis(50));
-                if st.move_gen.load(Ordering::SeqCst) != gen {
-                    return;
-                }
-                if let Some(w) = handle.get_webview_window(SIDEBAR) {
-                    if let (Ok(p), Ok(sf)) = (w.outer_position(), w.scale_factor()) {
-                        let p = p.to_logical::<f64>(sf);
-                        settings::save_position(&handle, p.x, p.y);
-                    }
-                }
-            });
+            let _ = move_tx.send(());
         }
     });
     Ok(w)
@@ -385,16 +429,19 @@ fn toggle_sidebar(app: &AppHandle) {
     }
 }
 
-fn build_tray(app: &AppHandle, settings_blocked: bool) -> tauri::Result<()> {
+/// Returns the menu + "Reset Settings" item when that item was added (settings writes blocked).
+fn build_tray(app: &AppHandle, settings_blocked: bool) -> tauri::Result<Option<(Menu<tauri::Wry>, MenuItem<tauri::Wry>)>> {
     let toggle = MenuItem::with_id(app, "toggle", "Show/Hide Sidebar", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit AgentMeter", true, Some("CmdOrCtrl+Q"))?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&toggle, &settings, &sep, &quit])?;
+    let mut reset_handles = None;
     if settings_blocked {
-        // Only offered when the settings file is unreadable and couldn't be backed up.
+        // Only offered while the settings file is unreadable and couldn't be backed up.
         let reset = MenuItem::with_id(app, "reset", "Reset Settings (settings file unreadable)", true, None::<&str>)?;
         menu.insert(&reset, 2)?;
+        reset_handles = Some((menu.clone(), reset));
     }
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("AgentMeter")
@@ -420,7 +467,7 @@ fn build_tray(app: &AppHandle, settings_blocked: bool) -> tauri::Result<()> {
         }
     }
     tray.build(app)?;
-    Ok(())
+    Ok(reset_handles)
 }
 
 // ---------- polling ----------
@@ -515,13 +562,13 @@ pub fn run() {
                 }),
                 usage: Mutex::new(UsageCache { data: Vec::new() }),
                 wake_poller: Mutex::new(tx),
-                move_gen: AtomicU64::new(0),
+                reset_item: Mutex::new(None),
                 drag_seen: Mutex::new(None),
                 refit_after_drag: AtomicBool::new(false),
             });
             app.manage(state.clone());
 
-            build_tray(&handle, loaded.blocked.is_some())?;
+            *state.reset_item.lock().unwrap() = build_tray(&handle, loaded.blocked.is_some())?;
             create_sidebar(&handle, &state)?;
             spawn_poller(handle, state, rx);
             Ok(())
