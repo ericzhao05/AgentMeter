@@ -51,6 +51,8 @@ h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .01em; color:
   background: #2a1517; border: 2px solid var(--outline); border-radius: 10px; color: #ffb4ad;
 }
 .load-error[hidden] { display: none; }
+.load-error span { min-width: 0; overflow-wrap: anywhere; line-height: 1.35; }
+.load-error button { flex: none; }
 .load-error button {
   background: var(--btn); border: 2px solid var(--outline); border-radius: 7px; padding: 4px 12px; cursor: pointer; color: var(--text);
 }
