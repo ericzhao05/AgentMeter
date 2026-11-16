@@ -27,10 +27,11 @@ pub enum DockEdge {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// How many tubes the sidebar shows (1..=8).
+    /// Legacy (older settings screens): ignored for rendering; kept so old files round-trip.
     pub tube_count: u8,
-    /// Enabled agent ids, in display order (may be longer than tube_count).
+    /// Enabled agent ids, in display order. The sidebar shows one tube per entry (max 8).
     pub agents: Vec<String>,
+    /// Legacy: demo mode now comes only from the AGENTMETER_DEMO env var; this mirrors it.
     pub demo_mode: bool,
     pub dock_edge: DockEdge,
 }

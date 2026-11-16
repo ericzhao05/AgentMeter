@@ -1,4 +1,4 @@
-/* AgentMeter sidebar: one tube per chosen agent. Data arrives from Rust via the
+/* AgentMeter sidebar: one tube per enabled agent. Data arrives from Rust via the
    'usage-updated' and 'settings-changed' events; get_usage / get_settings seed the first frame. */
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -16,6 +16,7 @@ const colorFor = id => AGENT_COLORS[id] ?? FALLBACK[[...id].reduce((h, c) => (h 
 const FPS_ACTIVE = 30, FPS_IDLE = 20;   // slow liquid reads fine at 30 fps; 60 fps doubles WKWebView repaint cost
 const REFILL_JUMP = 20;         // a rise of this many points means the window reset → pour animation
 const REFILL_MS = 2100;         // refill() glugs to 100% over ~2 s; then settle on the real level
+const MAX_TUBES = 8;
 
 let settings = { tubeCount: 4, agents: [], demoMode: false, dockEdge: 'right' };
 let usage = [];
@@ -23,10 +24,11 @@ let settingsKnown = false;   // don't render (or resize) until the real settings
 const cols = new Map();         // agent id → { el, tube, last, refillTimer }
 const $ = id => document.getElementById(id);
 
-/* Exactly the enabled agents, in order, up to tubeCount. First-run defaults are chosen by the backend;
-   in demo mode the same ids are matched to mock data (an id without a mock entry shows as unknown). */
+/* Every enabled agent gets a tube, in settings order (capped at MAX_TUBES; tubeCount is legacy and ignored).
+   First-run defaults are chosen by the backend; in demo mode the same ids are matched to mock data
+   (an id without a mock entry shows as unknown). */
 function chosenIds() {
-  return settings.agents.slice(0, settings.tubeCount);
+  return settings.agents.slice(0, MAX_TUBES);
 }
 
 /* Measured in WKWebView (2x display): the blurred glow layers are the main GPU cost and are only skipped
@@ -36,19 +38,30 @@ function glowFor(n) { return n <= 2 ? 1 : n <= 4 ? .8 : 0; }
 function makeCol(id) {
   const el = document.createElement('div');
   el.className = 'col';
-  el.innerHTML = '<div class="label"><span class="name"></span><span class="pct"></span><span class="reset"></span></div>';
+  el.innerHTML = '<div class="qmark" aria-hidden="true">?</div>'
+    + '<div class="label"><span class="name"></span><span class="pct"></span><span class="reset"></span></div>';
   const tube = createTube({ width: 70, height: 280, liquidColor: colorFor(id), fillLevel: 0, state: 'idle' });
   el.prepend(tube);
   return { el, tube, last: null, refillTimer: 0 };
 }
 
+/* Time left until reset: "2h 15min" / "45min" / "<1min"; days for long (e.g. weekly) windows. */
 function formatReset(iso) {
-  if (!iso) return '';
-  const ms = Date.parse(iso) - Date.now();
-  if (!(ms > 0)) return '↻ now';
-  const m = Math.round(ms / 60000), h = Math.floor(m / 60), d = Math.floor(h / 24);
-  if (d >= 1) return `↻ ${d}d ${h % 24}h`;
-  return h ? `↻ ${h}h ${String(m % 60).padStart(2, '0')}m` : `↻ ${Math.max(1, m)}m`;
+  const t = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(t)) return '';
+  const m = Math.floor((t - Date.now()) / 60000);
+  if (m < 1) return '<1min';
+  const h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d >= 1) return `${d}d ${h % 24}h`;
+  return h ? `${h}h ${m % 60}min` : `${m}min`;
+}
+
+/* "Limit resets in 2h 15min" (time kept on one line when it wraps); no reset time → empty. */
+function showReset(el, iso) {
+  const left = formatReset(iso);
+  el.dataset.iso = left ? iso : '';
+  el.textContent = left ? 'Limit resets in ' : '';
+  if (left) { const t = document.createElement('span'); t.className = 't'; t.textContent = left; el.append(t); }
 }
 
 function updateCol(id, c, a, glow) {
@@ -78,9 +91,9 @@ function updateCol(id, c, a, glow) {
 
   const q = s => c.el.querySelector(s);
   q('.name').textContent = a?.name ?? id;
-  q('.pct').textContent = known ? `${a.exact ? '' : '~'}${Math.round(pct)}%` : '?';
-  q('.reset').textContent = known ? formatReset(a.resetsAt) : (!a ? 'not detected' : !a.installed ? 'not installed' : '');
-  q('.reset').dataset.iso = known ? (a.resetsAt ?? '') : '';
+  q('.pct').textContent = known ? `${a.exact ? '' : '~'}${Math.round(pct)}%`
+    : !a ? 'Not detected' : !a.installed ? 'Not installed' : 'Usage unavailable';
+  showReset(q('.reset'), known ? a.resetsAt : null);
   const tip = [a?.name ?? id,
     known ? `${a.exact ? '' : 'about '}${pct.toFixed(0)}% of the ${a.window ?? 'current'} limit left` : 'usage unknown',
     a?.resetsAt ? `resets ${new Date(a.resetsAt).toLocaleString()}` : '', a?.note ?? ''].filter(Boolean);
@@ -105,7 +118,7 @@ function render() {
 }
 
 // Reset countdowns tick between polls.
-setInterval(() => document.querySelectorAll('.reset[data-iso]').forEach(el => { if (el.dataset.iso) el.textContent = formatReset(el.dataset.iso); }), 30000);
+setInterval(() => document.querySelectorAll('.reset[data-iso]').forEach(el => { if (el.dataset.iso) showReset(el, el.dataset.iso); }), 30000);
 
 $('settings').addEventListener('click', () => invoke('open_settings').catch(console.error));
 $('empty-settings').addEventListener('click', () => invoke('open_settings').catch(console.error));

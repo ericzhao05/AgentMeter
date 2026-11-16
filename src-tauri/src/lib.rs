@@ -23,7 +23,7 @@ const DEMO_POLL: Duration = Duration::from_secs(2);
 // Sidebar geometry in logical pixels; must match the layout in ui/sidebar.css.
 const COL_W: f64 = 86.0; // one tube column (70 px tube + label room)
 const PAD_X: f64 = 10.0;
-const SIDEBAR_H: f64 = 372.0; // toolbar 26 + tube 280 + label 56 + bottom 10
+const SIDEBAR_H: f64 = 382.0; // toolbar 26 + tube 280 + label 66 + bottom 10
 const EDGE_MARGIN: f64 = 6.0;
 
 /// Settings plus the first-run flag behind ONE mutex. Every settings write holds it across
@@ -36,16 +36,14 @@ struct SettingsStore {
     blocked: Option<String>,
 }
 
-/// Latest usage snapshot. `gen` bumps whenever demo mode is toggled; a poll that started under
-/// an older generation is dropped instead of published.
+/// Latest usage snapshot (published under its lock so emits stay in order).
 struct UsageCache {
-    gen: u64,
     data: Vec<AgentUsage>,
-    /// Last real (non-demo) poll, used to show a "refreshing" state when demo mode is turned off.
-    last_real: Vec<AgentUsage>,
 }
 
 struct AppState {
+    /// Demo mode, fixed at launch by the AGENTMETER_DEMO env var (development only; no UI toggle).
+    demo: bool,
     store: Mutex<SettingsStore>,
     usage: Mutex<UsageCache>,
     wake_poller: Mutex<Sender<()>>,
@@ -96,12 +94,18 @@ fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Settings {
     state.store.lock().unwrap().settings.clone()
 }
 
+/// AGENTMETER_DEMO=1 (or true/yes) runs on mock data instead of real usage.
+fn demo_from_env() -> bool {
+    std::env::var("AGENTMETER_DEMO").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Async so the file write + fsync never runs on the main thread; persistence itself is
 /// serialized by the settings mutex on a blocking worker.
 #[tauri::command]
 async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
-    let settings = settings.normalized();
     let state = app.state::<Arc<AppState>>().inner().clone();
+    // demoMode in the file is legacy: the env var decides, so keep it pinned to that.
+    let settings = Settings { demo_mode: state.demo, ..settings.normalized() };
     let (a, st, s) = (app.clone(), state.clone(), settings.clone());
     let old = tauri::async_runtime::spawn_blocking(move || persist(&a, &st, s)).await.map_err(|e| e.to_string())??;
     if settings.dock_edge != old.dock_edge {
@@ -111,9 +115,6 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
                 dock(&w, edge, None);
             }
         });
-    }
-    if settings.demo_mode != old.demo_mode {
-        switch_mode(&app, &state, &settings);
     }
     Ok(())
 }
@@ -146,7 +147,7 @@ fn reset_settings(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = state.store.lock().unwrap();
-        let fresh = Settings::default();
+        let fresh = Settings { demo_mode: state.demo, ..Settings::default() };
         match settings::save(&app, &fresh) {
             Ok(()) => {
                 store.blocked = None;
@@ -158,46 +159,6 @@ fn reset_settings(app: &AppHandle) {
             Err(e) => eprintln!("[agentmeter] reset failed: {e}"),
         }
     });
-}
-
-/// Demo mode toggled: invalidate in-flight polls and publish the new mode's state right away
-/// (mock data when turning demo on; a "refreshing" placeholder until the next real poll when off).
-fn switch_mode(app: &AppHandle, state: &AppState, settings: &Settings) {
-    {
-        let mut cache = state.usage.lock().unwrap();
-        cache.gen += 1;
-        cache.data = if settings.demo_mode {
-            usage::mock_all(launch_secs())
-        } else {
-            refreshing(&cache.last_real, &settings.agents)
-        };
-        let _ = app.emit("usage-updated", &cache.data);
-    }
-    let _ = state.wake_poller.lock().unwrap().send(());
-}
-
-/// Placeholder rows (usage unknown) shown while the first real poll after demo mode is running.
-fn refreshing(last_real: &[AgentUsage], enabled: &[String]) -> Vec<AgentUsage> {
-    let mut rows: Vec<AgentUsage> = last_real
-        .iter()
-        .map(|a| AgentUsage { percent_left: None, active: false, exact: false, note: Some("Refreshing…".into()), ..a.clone() })
-        .collect();
-    for id in enabled {
-        if !rows.iter().any(|a| &a.id == id) {
-            rows.push(AgentUsage {
-                id: id.clone(),
-                name: id.clone(),
-                installed: true,
-                percent_left: None,
-                resets_at: None,
-                window: None,
-                active: false,
-                exact: false,
-                note: Some("Refreshing…".into()),
-            });
-        }
-    }
-    rows
 }
 
 #[tauri::command]
@@ -298,7 +259,7 @@ fn clamp_into(areas: &[(f64, f64, f64, f64)], x: f64, y: f64, w: f64, h: f64) ->
 
 fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<WebviewWindow> {
     let s = state.store.lock().unwrap().settings.clone();
-    let width = sidebar_width(s.tube_count.min(s.agents.len().max(1) as u8) as u32);
+    let width = sidebar_width(s.agents.len().clamp(1, settings::MAX_TUBES as usize) as u32);
     let w = WebviewWindowBuilder::new(app, SIDEBAR, WebviewUrl::App("sidebar.html".into()))
         .title("AgentMeter")
         .inner_size(width, SIDEBAR_H)
@@ -393,7 +354,7 @@ fn show_settings(app: &AppHandle) -> tauri::Result<()> {
     }
     let w = WebviewWindowBuilder::new(app, SETTINGS, WebviewUrl::App("settings.html".into()))
         .title("AgentMeter Settings")
-        .inner_size(420.0, 560.0)
+        .inner_size(360.0, 420.0)
         .resizable(false)
         .maximizable(false)
         .center()
@@ -457,11 +418,18 @@ fn build_tray(app: &AppHandle, settings_blocked: bool) -> tauri::Result<()> {
 fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) {
     std::thread::spawn(move || loop {
         while wake.try_recv().is_ok() {} // wakes sent before this poll starts are covered by it
-        // Read the generation BEFORE the mode, so a toggle in between always invalidates this poll.
-        let gen = state.usage.lock().unwrap().gen;
-        let demo = state.store.lock().unwrap().settings.demo_mode;
+        let demo = state.demo;
         let data = if demo { usage::mock_all(launch_secs()) } else { usage::poll_all() };
 
+        // Demo run with no agent list yet: show the mock agents, in memory only (never saved, so
+        // demo data can't become the real first-run defaults).
+        if demo {
+            let mut store = state.store.lock().unwrap();
+            if store.needs_default_agents && store.settings.agents.is_empty() {
+                store.settings.agents = data.iter().filter(|a| a.installed).map(|a| a.id.clone()).collect();
+                let _ = app.emit("settings-changed", &store.settings);
+            }
+        }
         // First run (no usable agent list on disk): enable every installed agent, in detection order.
         if !demo {
             let mut store = state.store.lock().unwrap();
@@ -493,17 +461,11 @@ fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) 
 
         {
             let mut cache = state.usage.lock().unwrap();
-            if cache.gen != gen {
-                continue; // demo mode was toggled while polling: drop this result, poll again now
-            }
-            if !demo {
-                cache.last_real = data.clone();
-            }
             cache.data = data;
             let _ = app.emit("usage-updated", &cache.data); // under the lock: no stale emit can follow a newer one
         }
 
-        // Sleep until the next poll, or until settings wake us (demo mode toggled).
+        // Sleep until the next poll, or until woken (settings reset re-seeds the agent list).
         match wake.recv_timeout(if demo { DEMO_POLL } else { REAL_POLL }) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             _ => {}
@@ -528,15 +490,18 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory); // menu-bar app: no Dock icon
 
             let handle = app.handle().clone();
-            let loaded = settings::load(&handle);
+            let demo = demo_from_env();
+            let mut loaded = settings::load(&handle);
+            loaded.settings.demo_mode = demo; // legacy field: reflects the env var, not the file
             let (tx, rx) = mpsc::channel();
             let state = Arc::new(AppState {
+                demo,
                 store: Mutex::new(SettingsStore {
                     settings: loaded.settings,
                     needs_default_agents: loaded.needs_default_agents,
                     blocked: loaded.blocked.clone(),
                 }),
-                usage: Mutex::new(UsageCache { gen: 0, data: Vec::new(), last_real: Vec::new() }),
+                usage: Mutex::new(UsageCache { data: Vec::new() }),
                 wake_poller: Mutex::new(tx),
                 move_gen: AtomicU64::new(0),
                 drag_seen: Mutex::new(None),
@@ -567,7 +532,7 @@ mod tests {
     fn clamp_pulls_whole_sidebar_back_on_screen() {
         let screen = [(0.0, 25.0, 1440.0, 875.0)];
         // 708 px wide sidebar restored at x=1300 after a resolution drop: right edge must fit.
-        assert_eq!(clamp_into(&screen, 1300.0, 600.0, 708.0, SIDEBAR_H), Some((732.0, 528.0)));
+        assert_eq!(clamp_into(&screen, 1300.0, 600.0, 708.0, SIDEBAR_H), Some((732.0, 518.0)));
         assert_eq!(clamp_into(&screen, -50.0, 0.0, 200.0, SIDEBAR_H), Some((0.0, 25.0)));
         assert_eq!(clamp_into(&screen, 100.0, 100.0, 200.0, SIDEBAR_H), Some((100.0, 100.0)));
         assert_eq!(clamp_into(&screen, 5000.0, 100.0, 200.0, SIDEBAR_H), None, "on no screen → caller docks");
@@ -577,18 +542,5 @@ mod tests {
     fn clamp_prefers_screen_with_most_overlap() {
         let screens = [(0.0, 0.0, 1440.0, 900.0), (1440.0, 0.0, 1920.0, 1080.0)];
         assert_eq!(clamp_into(&screens, 1400.0, 100.0, 364.0, SIDEBAR_H), Some((1440.0, 100.0)));
-    }
-
-    #[test]
-    fn refreshing_rows_are_unknown_and_cover_enabled_ids() {
-        let real = vec![AgentUsage {
-            id: "codex".into(), name: "Codex".into(), installed: true, percent_left: Some(40.0),
-            resets_at: None, window: Some("5h".into()), active: true, exact: true, note: None,
-        }];
-        let rows = refreshing(&real, &["codex".into(), "gemini".into()]);
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|a| a.percent_left.is_none() && !a.active && a.installed));
-        assert_eq!(rows[0].name, "Codex");
-        assert_eq!(rows[1].id, "gemini");
     }
 }

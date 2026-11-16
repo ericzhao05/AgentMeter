@@ -1,5 +1,5 @@
 /* Sidebar layout. Column width / heights must match the constants in src-tauri/src/lib.rs
-   (COL_W 86, PAD_X 10, SIDEBAR_H 372 = bar 26 + tube 280 + label 56 + bottom 10). */
+   (COL_W 86, PAD_X 10, SIDEBAR_H 382 = bar 26 + tube 280 + label 66 + bottom 10). */
 :root { color-scheme: dark; }
 html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
 body {
@@ -22,17 +22,29 @@ body {
 .bar button:focus-visible { outline: 2px solid #D946EF; outline-offset: 1px; }
 
 .tubes { display: flex; flex: 1; }
-.col { width: 86px; flex: none; display: flex; flex-direction: column; align-items: center; }
+.col { width: 86px; flex: none; display: flex; flex-direction: column; align-items: center; position: relative; }
 .col .tube { flex: none; }
-.label { height: 56px; width: 100%; box-sizing: border-box; padding-top: 4px; text-align: center; display: grid; align-content: start; gap: 1px; }
+.label { height: 66px; width: 100%; box-sizing: border-box; padding-top: 4px; text-align: center; display: grid; align-content: start; gap: 1px; }
 .label .name { font-weight: 600; font-size: 11px; color: #c8c8d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 2px; }
 .label .pct { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent, #fff); }
-.label .reset { font-size: 10px; color: #7a7a84; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.label .reset .t { white-space: nowrap; }
+.label .reset { font-size: 9.5px; line-height: 1.15; color: #8b8b95; font-variant-numeric: tabular-nums; padding: 0 3px; }
 .col.low .label .pct { color: #FF6B60; }
 
 /* Unknown usage: dimmed, empty tube and a "?" — never a made-up number. */
 .col.unknown .tube { opacity: .42; filter: saturate(.2); }
-.col.unknown .label .pct { color: #6c6c76; }
+.col.unknown .label .pct { color: #8b8b95; font-size: 10px; font-weight: 600; line-height: 1.2; padding-top: 3px; }
+
+/* Big "?" inside the glass of an unknown tube. Glass centre: 33px into the 70px tube (the spine takes
+   the right side), tube offset 8px in the 86px column; vertical centre of the 280px tube. */
+.qmark {
+  display: none; position: absolute; left: 41px; top: 140px; transform: translate(-50%, -50%);
+  font: 800 42px/1 ui-rounded, "SF Pro Rounded", "Avenir Next", system-ui, sans-serif;
+  color: #F4E9FF; -webkit-text-stroke: 1.5px #0A0A0C; paint-order: stroke fill;
+  text-shadow: 0 0 6px #D946EF, 0 0 16px rgba(217, 70, 239, .6);
+  pointer-events: none;
+}
+.col.unknown .qmark { display: block; }
 .col.missing .label .name { color: #6c6c76; }
 
 .empty[hidden] { display: none; }
