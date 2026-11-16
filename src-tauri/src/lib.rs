@@ -50,18 +50,34 @@ struct AppState {
     usage: Mutex<UsageCache>,
     wake_poller: Mutex<Sender<()>>,
     move_gen: AtomicU64,
-    /// Last user-drag activity (drag start, or a Move event while a drag is live).
+    /// Last window movement (every Move event, plus the sidebar's drag start).
     drag_seen: Mutex<Option<Instant>>,
-    /// A scale/monitor change arrived mid-drag; re-fit once the drag ends.
+    /// A scale/monitor change arrived mid-drag; a deferred re-fit is scheduled.
     refit_after_drag: AtomicBool,
 }
 
 const DRAG_QUIET: Duration = Duration::from_millis(600);
 
 impl AppState {
-    fn dragging(&self) -> bool {
+    fn recently_moved(&self) -> bool {
         self.drag_seen.lock().unwrap().is_some_and(|t| t.elapsed() < DRAG_QUIET)
     }
+
+    /// A user window drag may be in progress. On macOS a drag always holds a mouse button, which
+    /// also covers pausing mid-drag; elsewhere fall back to "moved within the quiet window".
+    fn user_dragging(&self) -> bool {
+        if cfg!(target_os = "macos") { mouse_button_down() } else { self.recently_moved() }
+    }
+}
+
+/// Is any mouse button currently held (system-wide)? Cheap NSEvent class query.
+#[cfg(target_os = "macos")]
+fn mouse_button_down() -> bool {
+    objc2_app_kit::NSEvent::pressedMouseButtons() != 0
+}
+#[cfg(not(target_os = "macos"))]
+fn mouse_button_down() -> bool {
+    false
 }
 
 fn launch_secs() -> f64 {
@@ -206,7 +222,7 @@ fn resize_sidebar(window: WebviewWindow, state: tauri::State<'_, Arc<AppState>>,
     }
     let pos = window.outer_position().map_err(|e| e.to_string())?.to_logical::<f64>(scale);
     window.set_size(LogicalSize::new(w, SIDEBAR_H)).map_err(|e| e.to_string())?;
-    if state.dragging() {
+    if state.user_dragging() {
         return Ok(());
     }
     let edge = state.store.lock().unwrap().settings.dock_edge;
@@ -312,30 +328,22 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
         // Never during a user drag (e.g. dragging between displays with different scaling):
         // remember it and re-fit once the drag ends.
         if let WindowEvent::ScaleFactorChanged { .. } = e {
-            if st.dragging() {
-                st.refit_after_drag.store(true, Ordering::SeqCst);
+            if st.recently_moved() || st.user_dragging() {
+                if !st.refit_after_drag.swap(true, Ordering::SeqCst) {
+                    schedule_refit(handle.clone(), st.clone());
+                }
             } else {
                 refit_sidebar(&handle, &st);
             }
         }
         if let WindowEvent::Moved(_) = e {
-            {
-                let mut drag = st.drag_seen.lock().unwrap();
-                if drag.is_some_and(|t| t.elapsed() < DRAG_QUIET) {
-                    *drag = Some(Instant::now()); // still dragging
-                }
-            }
+            *st.drag_seen.lock().unwrap() = Some(Instant::now()); // every move renews the marker
             let gen = st.move_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let (handle, st) = (handle.clone(), st.clone());
             std::thread::spawn(move || {
                 std::thread::sleep(DRAG_QUIET + Duration::from_millis(50));
                 if st.move_gen.load(Ordering::SeqCst) != gen {
                     return;
-                }
-                // Movement stopped: if a scale change was deferred during a drag, re-fit now.
-                if !st.dragging() && st.refit_after_drag.swap(false, Ordering::SeqCst) {
-                    let (h, s2) = (handle.clone(), st.clone());
-                    let _ = handle.run_on_main_thread(move || refit_sidebar(&h, &s2));
                 }
                 if let Some(w) = handle.get_webview_window(SIDEBAR) {
                     if let (Ok(p), Ok(sf)) = (w.outer_position(), w.scale_factor()) {
@@ -347,6 +355,23 @@ fn create_sidebar(app: &AppHandle, state: &Arc<AppState>) -> tauri::Result<Webvi
         }
     });
     Ok(w)
+}
+
+/// Deferred re-fit after a mid-drag scale change: wait out the quiet window, then on the main
+/// thread re-check that the window is still and no button is held; otherwise try again later.
+fn schedule_refit(app: AppHandle, st: Arc<AppState>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(DRAG_QUIET + Duration::from_millis(50));
+        let (h, s2) = (app.clone(), st.clone());
+        let _ = app.run_on_main_thread(move || {
+            if s2.recently_moved() || s2.user_dragging() {
+                schedule_refit(h, s2);
+            } else {
+                s2.refit_after_drag.store(false, Ordering::SeqCst);
+                refit_sidebar(&h, &s2);
+            }
+        });
+    });
 }
 
 /// Keep the sidebar fully on a screen at its current position (after a scale/monitor change).
