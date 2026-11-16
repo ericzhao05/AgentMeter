@@ -163,9 +163,13 @@ fn persist(app: &AppHandle, state: &AppState, settings: Settings) -> Result<(), 
             Err(_) => return Err(msg),
         }
     }
-    store.write(app, &settings)?;
+    // Demo run on a first-ever launch: the list started from mock agents, so keep changes in memory
+    // only and leave first-run detection pending for the next real launch.
+    if !(state.demo && store.needs_default_agents) {
+        store.write(app, &settings)?;
+        store.needs_default_agents = false;
+    }
     store.settings = settings.clone();
-    store.needs_default_agents = false;
     app.emit("settings-changed", &settings).map_err(|e| e.to_string())
 }
 
@@ -559,8 +563,9 @@ fn spawn_poller(app: AppHandle, state: Arc<AppState>, wake: mpsc::Receiver<()>) 
         let demo = state.demo;
         let data = if demo { usage::mock_all(launch_secs()) } else { usage::poll_all() };
 
-        // Demo run with no agent list yet: show the mock agents, in memory only (never saved, so
-        // demo data can't become the real first-run defaults).
+        // Demo run with no agent list yet: show the mock agents in memory. While first-run detection
+        // is pending, `persist` keeps even Settings toggles in memory, so demo data never becomes the
+        // real first-run defaults.
         if demo {
             let mut store = state.store.lock().unwrap();
             if store.needs_default_agents && store.settings.agents.is_empty() {
