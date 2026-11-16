@@ -575,7 +575,7 @@ fn glide(w: &WebviewWindow, st: &AppState, from: (f64, f64), to: (f64, f64), edg
         if done { "" } else { " CANCELLED (re-grabbed)" },
         t0.elapsed()
     );
-    let _ = edge;
+    let _ = (edge, steps, max_gap); // only reported by the debug-build log above
     done
 }
 
