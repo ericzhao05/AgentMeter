@@ -481,7 +481,9 @@ fn record_failure(st: &mut LiveState, e: &LiveError, now: DateTime<Utc>, jitter0
         .retry_after
         .as_deref()
         .and_then(|v| retry_after_secs(v, now))
-        .map(|s| s.clamp(1, RETRY_AFTER_MAX_SECS))
+        // Never retry sooner than the base backoff, even if the server says
+        // `Retry-After: 0`/`1` (that previously produced a ~1 s backoff).
+        .map(|s| s.clamp(BACKOFF_BASE_SECS, RETRY_AFTER_MAX_SECS))
         .unwrap_or_else(|| backoff_secs(st.failures, jitter01));
     st.backoff_until = Some(now + Duration::seconds(wait));
     st.last_error = Some(e.msg.clone());
@@ -1029,6 +1031,30 @@ mod tests {
         assert_eq!(r.percent_left, Some(70.0));
         assert!(r.exact);
         assert_eq!(store.snapshot(None).failures, 0);
+    }
+
+    #[test]
+    fn tiny_retry_after_still_backs_off_at_least_60s() {
+        for header in ["0", "1"] {
+            let d = home_with_claude();
+            let store = Store::new();
+            let now = t("2026-11-15T12:00:00Z");
+            let r = cached_reading_with(&store, &live_ctx(d.path(), now, None), &rate_limited(Some(header)), 0.0);
+            assert_eq!(store.snapshot(None).backoff_until, Some(now + Duration::seconds(60)), "Retry-After: {header}");
+            assert!(r.note.contains("retrying in 1m"), "{}", r.note);
+            // The next 45 s poll must not call the API, and shows the real remaining time.
+            let r = cached_reading_with(&store, &live_ctx(d.path(), now + Duration::seconds(45), None), &never, 0.0);
+            assert!(r.note.contains("retrying in 15s"), "{}", r.note);
+            // At 90 s it may fetch again.
+            let r = cached_reading_with(&store, &live_ctx(d.path(), now + Duration::seconds(90), None), &ok_reading(50.0, None), 0.0);
+            assert_eq!(r.percent_left, Some(50.0));
+        }
+        // A Retry-After date already in the past is floored too.
+        let d = home_with_claude();
+        let store = Store::new();
+        let now = t("2026-11-15T12:00:00Z");
+        cached_reading_with(&store, &live_ctx(d.path(), now, None), &rate_limited(Some("Sun, 15 Nov 2026 11:00:00 GMT")), 0.0);
+        assert_eq!(store.snapshot(None).backoff_until, Some(now + Duration::seconds(60)));
     }
 
     #[test]
